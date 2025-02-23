@@ -1,6 +1,7 @@
 /BrainAgent/models/model-00001-of-00002.safetensors
 /BrainAgent/models/model-00002-of-00002.safetensors
 /BrainAgent/qwen_robot_env
+/BrainAgent/.env
 custom.toml
 **/.DS_Store
 .DS_Store

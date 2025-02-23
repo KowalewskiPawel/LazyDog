@@ -24,6 +24,21 @@ engine.setProperty('rate', 150)    # Speed
 engine.setProperty('volume', 0.9)  # Volume
 speech_queue = Queue()
 
+
+# Try to set Polish voice
+voices = engine.getProperty('voices')
+for voice in voices:
+    # Print available voices for debugging
+    print(f"Found voice: {voice.name} ({voice.id})")
+    if 'polish' in voice.name.lower() or 'pl' in voice.id.lower():
+        print(f"Setting Polish voice: {voice.name}")
+        engine.setProperty('voice', voice.id)
+        break
+
+# Test Polish TTS
+engine.say("Dzień dobry")
+engine.runAndWait()
+
 def speech_worker():
     while True:
         text = speech_queue.get()

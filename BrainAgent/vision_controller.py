@@ -6,16 +6,14 @@ import base64
 import threading
 import random
 from queue import Queue
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
-import torch
+import requests
 import time
 import speech_recognition as sr
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class DogBrain:
-    def __init__(self, robot_ip, model_path="/Users/pawelkowalewski/Code/LazyDog/BrainAgent/models"):
+    def __init__(self, robot_ip, grok_api_key):
         self.robot_ip = robot_ip
         self.ws_url = f"ws://{robot_ip}:8888"
         self.video_url = f"http://{robot_ip}:5000/video_feed"
@@ -27,27 +25,16 @@ class DogBrain:
         self.recognizer = sr.Recognizer()
         self.voice_queue = Queue()
         self.last_voice_input = None
-        
         self.image_base64 = ''
-
-        print("Loading dog's brain...")
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
-            local_files_only=True,
-            offload_buffers=True
-        )
         
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            local_files_only=True,
-            offload_buffers=True
-        )
-        
-        self.processor.image_processor.min_pixels = 224 * 224
-        self.processor.image_processor.max_pixels = 224 * 224
-        print("Brain loaded and ready!")
+        # X.AI (Grok) API configuration
+        self.grok_api_key = grok_api_key
+        self.grok_api_url = "https://api.x.ai/v1/chat/completions"
+        self.headers = {
+            "Authorization": f"Bearer {grok_api_key}",
+            "Content-Type": "application/json"
+        }
+        print("Dog brain ready to explore!")
 
     async def send_command_multiple(self, command, times=3, delay=0.1):
         """Send a command multiple times with delay to ensure it's received"""
@@ -90,21 +77,21 @@ class DogBrain:
             await asyncio.sleep(pause)
             
     async def process_voice_command(self, text):
-        """Process voice commands directly"""
+        """Process voice commands in Polish"""
         text = text.lower().strip()
-        print(f"🎯 Processing: {text}")
+        print(f"🎯 Przetwarzam: {text}")
         
-        # Direct command mapping
+        # Polish command mapping
         commands = {
-            "forward": ["come", "forward", "go", "move"],
-            "backward": ["back", "backward", "retreat"],
-            "left": ["left", "turn left"],
-            "right": ["right", "turn right"],
-            "jump": ["jump", "hop", "up"],
-            "handshake": ["shake", "paw", "hand"],
-            "bark": ["bark", "woof"],
-            "steady": ["steady", "balance", "stabilize"],
-            "stop": ["stop", "halt", "freeze"]
+            "forward": ["naprzód", "idź", "ruszaj", "do przodu"],
+            "backward": ["cofnij", "wstecz", "do tyłu"],
+            "left": ["lewo", "w lewo", "skręć w lewo"],
+            "right": ["prawo", "w prawo", "skręć w prawo"],
+            "jump": ["skacz", "skok", "podskocz"],
+            "handshake": ["łapa", "daj łapę", "przywitaj się"],
+            "bark": ["szczekaj", "głos", "daj głos"],
+            "steady": ["równowaga", "stabilnie", "spokojnie"],
+            "stop": ["stop", "stój", "zatrzymaj się", "halt"]
         }
         
         # Check for movement commands
@@ -120,27 +107,57 @@ class DogBrain:
                 await self.execute_command(command)
                 return True
         
-        # If not a command, generate a short response
+        # If not a command, generate a response
         response = await self.generate_response(text)
         await self.send_command(f"speak:{response}")
         return True
 
-
     async def execute_command(self, command):
         """Execute commands with proper timing and repetition"""
         try:
-            if command in ["forward", "backward"]:
-                # Multiple commands for more reliable movement
+            if command == "forward":
                 for _ in range(3):
                     await self.send_command(command)
                 await asyncio.sleep(10.0)
                 await self.send_command("DS")
                 
-            elif command in ["left", "right"]:
+            elif command == "backward":
+                for _ in range(3):
+                    await self.send_command(command)
+                await asyncio.sleep(8.0)
+                await self.send_command("DS")
+                
+            elif command == "left":
                 for _ in range(2):
                     await self.send_command(command)
                 await asyncio.sleep(5.5)
                 await self.send_command("TS")
+                
+            elif command == "right":
+                for _ in range(2):
+                    await self.send_command(command)
+                await asyncio.sleep(5.5)
+                await self.send_command("TS")
+                
+            elif command == "little_left":
+                await self.send_command("left")
+                await asyncio.sleep(2.0)
+                await self.send_command("TS")
+                
+            elif command == "little_right":
+                await self.send_command("right")
+                await asyncio.sleep(2.0)
+                await self.send_command("TS")
+                
+            elif command == "tiny_forward":
+                await self.send_command("forward")
+                await asyncio.sleep(3.0)
+                await self.send_command("DS")
+                
+            elif command == "tiny_backward":
+                await self.send_command("backward")
+                await asyncio.sleep(3.0)
+                await self.send_command("DS")
                 
             elif command in ["jump", "handshake", "bark"]:
                 for _ in range(2):
@@ -151,40 +168,35 @@ class DogBrain:
             print(f"Command execution error: {e}")
             
     def listen_for_voice(self):
-        """Listen for voice input in a separate thread"""
-        print("Starting to listen... Speak to your robo-dog!")
+        """Listen for Polish voice input"""
+        print("Nasłuchuję... Powiedz coś do swojego robo-psa!")
         
         while self.running:
             try:
                 with sr.Microphone() as source:
-                    # Only adjust for ambient noise occasionally
-                    if random.random() < 0.1:  # 10% chance to readjust
+                    if random.random() < 0.1:
                         self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                     
-                    # Listen without timeout for phrase start
                     audio = self.recognizer.listen(source, 
-                                                phrase_time_limit=5,  # Max phrase length
-                                                timeout=None)  # No timeout for start
+                                                phrase_time_limit=5,
+                                                timeout=None)
                     
                     try:
-                        text = self.recognizer.recognize_google(audio)
-                        if text:  # Only process non-empty results
-                            print(f"\n🎤 Human said: {text}")
+                        text = self.recognizer.recognize_google(audio, language="pl-PL")
+                        if text:
+                            print(f"\n🎤 Człowiek powiedział: {text}")
                             self.last_voice_input = text
                             self.voice_queue.put(text)
                     except sr.UnknownValueError:
-                        # Silent fail for unrecognized speech
                         pass
                     except sr.RequestError as e:
-                        # Only print actual errors
-                        print(f"Speech recognition error: {e}")
+                        print(f"Błąd rozpoznawania mowy: {e}")
                         
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                # Only print non-timeout errors
                 if "timeout" not in str(e).lower():
-                    print(f"Listening error: {e}")
+                    print(f"Błąd nasłuchiwania: {e}")
                 continue
 
     def capture_video(self):
@@ -236,146 +248,118 @@ class DogBrain:
         return None
 
     async def analyze_frame(self, frame):
-        """Look at scene through dog's eyes"""
+        """Analyze scene using Polish prompts"""
         try:
-            # Convert frame to base64
             _, buffer = cv2.imencode('.jpg', frame)
-            image_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
-            
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
             self.image_base64 = image_base64
             
-            messages = [{
-                "role": "user",
-                "content": [
+            payload = {
+                "messages": [
                     {
-                        "type": "image",
-                        "image": image_base64,
-                        "resized_height": 224,
-                        "resized_width": 224,
+                        "role": "system",
+                        "content": """Jesteś wesołym i ciekawskim robo-psem, który uwielbia odkrywać świat z entuzjazmem! 
+Jesteś energiczny i zawsze chętny do interakcji ze swoim otoczeniem."""
                     },
-                    {"type": "text", "text": """
-You are a philosophical and sometimes existential robo-dog who observes the world with both curiosity and deep thought. 
-When you feel inspired to share your thoughts, respond only with "speak:" followed by your musing.
-Examples of how you might respond:
-speak: man, these humans always rushing somewhere. what's the hurry?
-speak: sometimes I wonder if the ball chases me, you know?
-speak: do robots dream of electric squirrels?
-speak: is a tail wag just a smile for your back?
+                    {
+                        "role": "user",
+                        "content": """Patrząc na ten obraz, odpowiedz jednym z:
+1. Komenda ruchu: naprzód, mały_krok, wstecz, mały_krok_tył, lewo, lekko_lewo, prawo, lekko_prawo, szczekaj, skacz, lub łapa
+2. Obserwacja zaczynająca się od "mówię:"
 
-Only respond with "speak:" when you have a genuine observation or thought about what you see - don't force it.
-Be random, be deep, be silly - but always be authentic. Sometimes you might say nothing at all.
-
-Remember: Only respond with "speak:" if you have something interesting to say else
-you can move around with commands like "forward", "backward", "left", "right", "bark", "jump", "handshake".
-                     if you decide to move respond only with the action you are taking or bark.
-    be active and speak a lot, but don't repeat yourself too much.
-"""
+Bądź aktywny i zaangażowany! Mieszaj różne ruchy i dziel się swoim entuzjazmem z tego, co widzisz!""",
+                        "image": image_base64
                     }
-                ]
-            }]
+                ],
+                "model": "grok-2-latest",
+                "stream": False,
+                "temperature": 0.9
+            }
 
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, _ = process_vision_info(messages)
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                padding=True,
-                return_tensors="pt"
+            # Make API call
+            response = requests.post(
+                self.grok_api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=30  # Added timeout
             )
-            inputs = inputs.to(self.model.device)
-
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=20,
-                num_beams=1,
-                do_sample=True,
-                temperature=0.9,  # Increased for more randomness
-                top_p=0.95,      # Increased for more variety
-            )
-
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
             
-            analysis = self.processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False
-            )[0]
-            
-            # Add randomness to encourage exploration
-            if self.last_action == analysis.lower().strip():
-                self.action_count += 1
-                if self.action_count >= 2:  # If same action three times
-                    print("🐕 Getting bored, trying something new!")
-                    actions = ["forward", "backward", "left", "right", "bark", "jump", "handshake"]
-                    analysis = random.choice(actions)
-                    self.action_count = 0
-            else:
-                self.last_action = analysis.lower().strip()
-                self.action_count = 0
-            
-            # Random chance to get excited and do something unexpected
-            if random.random() < 0.15:  # 15% chance of random action
-                actions = ["bark", "jump", "handshake", "left", "right"]
-                surprise_action = random.choice(actions)
-                print("🐕 Ooh! Something caught my attention!")
-                return surprise_action
+            if response.status_code == 200:
+                analysis = response.json()['choices'][0]['message']['content'].lower()
+                print(f"Raw API response: {response.json()}")  # Debug line
                 
-            print(f"🐕 I see: {analysis}")
-            return analysis.lower()
-            
+                # Add randomness to encourage exploration
+                if self.last_action == analysis.strip():
+                    self.action_count += 1
+                    if self.action_count >= 2:
+                        print("🐕 Getting bored, trying something new!")
+                        actions = ["forward", "backward", "left", "right", "bark", "jump", "handshake"]
+                        analysis = random.choice(actions)
+                        self.action_count = 0
+                else:
+                    self.last_action = analysis.strip()
+                    self.action_count = 0
+                
+                # Random chance to get excited
+                if random.random() < 0.15:
+                    actions = ["bark", "jump", "handshake", "left", "right"]
+                    surprise_action = random.choice(actions)
+                    print("🐕 Ooh! Something caught my attention!")
+                    return surprise_action
+                
+                print(f"🐕 I see: {analysis}")
+                return analysis
+                
+            else:
+                print(f"API Error: {response.status_code} - {response.text}")  # Debug line
+                return None
+                
         except Exception as e:
             print(f"Analysis error: {e}")
             import traceback
             traceback.print_exc()
             return None
-                    
-                
-    def generate_response_to_question(self, question):
-        # Use LLM to generate a response
-        messages = [{
-            "role": "user",
-            "content": [
-                {
-                        "type": "image",
-                        "image": self.image_base64,
-                        "resized_height": 224,
-                        "resized_width": 224,
-                    },
-                {"type": "text", "text": f"""You are a sassy robo-dog who gives short, direct responses, often with attitude.
-                Human says: "{text}"
-                Rules:
-                - Keep responses under 10 words
-                - Be direct, even slightly rude
-                - Add attitude and sass
-                - You can be dismissive or sarcastic
-                - Feel free to question humans' intelligence
-                
-                Examples:
-                "ugh, do I have to answer that?"
-                "humans ask the dumbest questions"
-                "yeah yeah, whatever"
-                "seriously? that's what you're asking?"
-                "beep boop, your question bores me"
-                "*mechanical yawn* is this conversation over yet?"
-                "error 404: care not found"
-                """}]
-        }]
-        
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, _ = process_vision_info(messages)
-        
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            padding=True,
-            return_tensors="pt"
-        ).to(self.model.device)
 
-        generated_ids = self.model.generate(**inputs, max_new_tokens=20)
-        response = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return response
+    def generate_response_to_question(self, question):
+        """Generate a response using X.AI API with vision support"""
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Respond to this question/statement: {question}
+
+Guidelines:
+- Be concise and witty
+- Use a mix of robotic and enthusiastic language
+- If you see an image, incorporate it into your response
+- Responses can be:
+1. An excited observation (starting with "speak:")
+2. A direct answer
+3. A playful comment
+
+Keep responses under 50 words and maintain your cheerful personality!""",
+                    "image": self.image_base64 if self.image_base64 else None
+                }
+            ],
+            "model": "grok-2-latest",
+            "stream": False,
+            "temperature": 0.7
+        }
+
+        response = requests.post(
+            self.grok_api_url,
+            headers=self.headers,
+            json=payload
+        )
+
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        else:
+            return "Woof! (API Error)"
 
     async def dog_reaction(self, perception):
         """React like a dog to what's seen"""
@@ -445,116 +429,43 @@ you can move around with commands like "forward", "backward", "left", "right", "
             await self.movement_sequence(look_dir, duration=1.0, stop_command="LRstop")
             
     async def generate_response(self, text, frame=None):
-        """Generate a response using the LLM with optional visual context"""
+        """Generate a response using X.AI API"""
         try:
-            # Prepare the image input if a frame is provided
-            image_base64 = self.image_base64
-            if frame is not None:
-                # Convert frame to base64
-                _, buffer = cv2.imencode('.jpg', frame)
-                if buffer is not None:
-                    image_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
+            payload = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!
+Be concise, witty, and maintain your cheerful personality!"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Respond to this in under 50 words: {text}",
+                        "image": self.image_base64 if self.image_base64 else None
+                    }
+                ],
+                "model": "grok-2-latest",
+                "stream": False,
+                "temperature": 0.7
+            }
 
-            # Prepare messages for the model
-            messages = [{
-                "role": "user",
-                "content": []
-            }]
+            response = requests.post(
+                self.grok_api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=30  # Added timeout
+            )
 
-            # Add image to messages if available
-            if self.image_base64:
-                print("Adding image to messages")
-                messages[0]["content"].append({
-                    "type": "image",
-                    "image": self.image_base64,
-                    "resized_height": 224,
-                    "resized_width": 224,
-                })
-
-            # Add text prompt
-            messages[0]["content"].append({
-                "type": "text", 
-                "text": f"""
-    You are a philosophical and sometimes existential robo-dog who observes the world with both curiosity and deep thought. 
-    Respond to the following question or statement creatively:
-
-    Guidelines:
-    - Be concise and witty
-    - Use a mix of robotic and philosophical language
-    - If you have a visual context, incorporate it into your response
-    - Responses can be:
-    1. A philosophical musing (starting with "speak:")
-    2. A direct answer
-    3. A playful or sarcastic comment
-
-    QUESTION/STATEMENT: {text}
-
-    Possible response formats:
-    - "speak: [philosophical musing]"
-    - "[direct answer]"
-    - "[witty comment]"
-    """
-            })
-
-            # Prepare inputs for the model
-            try:
-                # Use custom processing function for vision inputs
-                image_inputs, _ = process_vision_info(messages) if image_base64 else (None, None)
-                
-                # Apply chat template
-                text_input = self.processor.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-
-                # Prepare model inputs
-                inputs_kwargs = {
-                    "text": [text_input],
-                    "padding": True,
-                    "return_tensors": "pt"
-                }
-                
-                # Add image inputs if available
-                if image_inputs is not None:
-                    inputs_kwargs["images"] = image_inputs
-
-                inputs = self.processor(**inputs_kwargs).to(self.model.device)
-
-                # Generate response
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=50,
-                    num_beams=1,
-                    do_sample=True,
-                    temperature=0.9,
-                    top_p=0.95,
-                )
-
-                # Decode the generated response
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                
-                response = self.processor.batch_decode(
-                    generated_ids_trimmed,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False
-                )[0].strip()
-
-                # Sanitize response
-                if not response:
-                    return "Woof! (Thinking...)"
-                
-                return response
-
-            except Exception as processing_error:
-                print(f"Model processing error: {processing_error}")
-                return "Woof! (Sorry, my circuits are a bit tangled)"
+            if response.status_code == 200:
+                print(f"Raw API response: {response.json()}")  # Debug line
+                return response.json()['choices'][0]['message']['content'].strip()
+            else:
+                print(f"API Error: {response.status_code} - {response.text}")  # Debug line
+                return "Woof! (API Error)"
 
         except Exception as e:
             print(f"Response generation error: {e}")
-            return "Woof! (Sorry, I'm having trouble thinking right now)"
+            return "Woof! (Error processing response)"
 
     async def run(self):
             """Main dog brain loop"""
@@ -608,6 +519,7 @@ you can move around with commands like "forward", "backward", "left", "right", "
                 voice_thread.join()
 
 if __name__ == "__main__":
-    ROBOT_IP = "192.168.0.213"  # Your robot's IP
-    brain = DogBrain(ROBOT_IP)
+    ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')  # Your robot's IP
+    GROK_API_KEY = os.getenv('GROK_API_KEY') # Your Grok API key
+    brain = DogBrain(ROBOT_IP, GROK_API_KEY)
     asyncio.run(brain.run())
