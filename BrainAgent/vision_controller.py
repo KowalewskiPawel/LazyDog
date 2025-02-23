@@ -527,6 +527,7 @@ Be concise, witty, and maintain your cheerful personality!"""
                 voice_thread.join()
 
 if __name__ == "__main__":
-    ROBOT_IP = "192.168.0.213"  # Your robot's IP
-    brain = DogBrain(ROBOT_IP)
+    ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')  # Your robot's IP
+    GROK_API_KEY = os.getenv('GROK_API_KEY') # Your Grok API key
+    brain = DogBrain(ROBOT_IP, GROK_API_KEY)
     asyncio.run(brain.run())
