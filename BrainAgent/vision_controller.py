@@ -19,13 +19,15 @@ class DogBrain:
         self.video_url = f"http://{robot_ip}:5000/video_feed"
         self.websocket = None
         self.running = True
-        self.frame_queue = Queue(maxsize=2)
+        self.frame_queue = Queue(maxsize=5)  # Increased to store more frames
         self.last_action = None
         self.action_count = 0
         self.recognizer = sr.Recognizer()
         self.voice_queue = Queue()
         self.last_voice_input = None
         self.image_base64 = ''
+        self.last_frame_time = 0
+        self.frame_capture_success = False
         
         # X.AI (Grok) API configuration
         self.grok_api_key = grok_api_key
@@ -34,6 +36,8 @@ class DogBrain:
             "Authorization": f"Bearer {grok_api_key}",
             "Content-Type": "application/json"
         }
+        print(f"Dog brain initializing with Robot IP: {robot_ip}")
+        print(f"Video URL set to: {self.video_url}")
         print("Dog brain ready to explore!")
 
     async def send_command_multiple(self, command, times=3, delay=0.1):
@@ -207,23 +211,54 @@ class DogBrain:
 
     def capture_video(self):
         """Capture video frames in a separate thread"""
-        print("Starting dog vision... (Video preview disabled on macOS)")
-        cap = cv2.VideoCapture(self.video_url)
-
-        while self.running:
-            ret, frame = cap.read()
-            if ret:
-                # Clear queue if full
-                if self.frame_queue.full():
-                    try:
-                        self.frame_queue.get_nowait()
-                    except:
-                        pass
-                self.frame_queue.put(frame)
+        print(f"Starting dog vision... Connecting to {self.video_url}")
+        retry_count = 0
+        max_retries = 5
+        
+        while self.running and retry_count < max_retries:
+            try:
+                cap = cv2.VideoCapture(self.video_url)
+                if not cap.isOpened():
+                    print(f"Failed to open video stream at {self.video_url}, retrying...")
+                    retry_count += 1
+                    time.sleep(2)
+                    continue
                 
-                # No display attempt on macOS - just process frames
-
-        cap.release()
+                print("Video stream successfully opened!")
+                self.frame_capture_success = True
+                retry_count = 0  # Reset retry count on success
+                
+                while self.running:
+                    ret, frame = cap.read()
+                    if ret:
+                        # Clear queue if full
+                        if self.frame_queue.full():
+                            try:
+                                self.frame_queue.get_nowait()
+                            except:
+                                pass
+                        self.frame_queue.put(frame)
+                        self.last_frame_time = time.time()
+                    else:
+                        print("Failed to read frame, reconnecting...")
+                        break
+                        
+                    # Throttle capture rate
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"Video capture error: {e}")
+                retry_count += 1
+                time.sleep(2)
+            finally:
+                try:
+                    cap.release()
+                except:
+                    pass
+                
+        if retry_count >= max_retries:
+            print("Maximum video capture retries reached. Vision may not be available.")
+            self.frame_capture_success = False
 
     async def connect_websocket(self):
         """Connect to robot's body"""
@@ -279,11 +314,12 @@ Be active and engaging! Mix different movements and share your excitement about 
                         "image": image_base64
                     }
                 ],
-                "model": "grok-2-latest",
+                "model": "grok-2-vision-latest",  # Explicitly use the vision model
                 "stream": False,
                 "temperature": 0.9
             }
 
+            print("Sending image to Grok API for analysis...")
             # Make API call
             response = requests.post(
                 self.grok_api_url,
@@ -294,7 +330,7 @@ Be active and engaging! Mix different movements and share your excitement about 
             
             if response.status_code == 200:
                 analysis = response.json()['choices'][0]['message']['content'].lower()
-                print(f"Raw API response: {response.json()}")  # Debug line
+                print(f"Vision API response received!")
                 
                 # Add randomness to encourage exploration
                 if self.last_action == analysis.strip():
@@ -319,7 +355,7 @@ Be active and engaging! Mix different movements and share your excitement about 
                 return analysis
                 
             else:
-                print(f"API Error: {response.status_code} - {response.text}")  # Debug line
+                print(f"API Error: {response.status_code} - {response.text}")
                 return None
                 
         except Exception as e:
@@ -328,46 +364,43 @@ Be active and engaging! Mix different movements and share your excitement about 
             traceback.print_exc()
             return None
 
-    def generate_response_to_question(self, question):
-        """Generate a response using X.AI API with vision support"""
-        payload = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!"""
-                },
-                {
-                    "role": "user",
-                    "content": f"""Respond to this question/statement: {question}
+    async def generate_response(self, text, frame=None):
+        """Generate a response using X.AI API"""
+        try:
+            payload = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!
+Be concise, witty, and maintain your cheerful personality!"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Respond to this in under 50 words: {text}",
+                        "image": self.image_base64 if self.image_base64 else None
+                    }
+                ],
+                "model": "grok-2-vision-latest",  # Explicitly use the vision model
+                "stream": False,
+                "temperature": 0.7
+            }
 
-Guidelines:
-- Be concise and witty
-- Use a mix of robotic and enthusiastic language
-- If you see an image, incorporate it into your response
-- Responses can be:
-1. An excited observation (starting with "speak:")
-2. A direct answer
-3. A playful comment
+            response = requests.post(
+                self.grok_api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=30  # Added timeout
+            )
 
-Keep responses under 50 words and maintain your cheerful personality!""",
-                    "image": self.image_base64 if self.image_base64 else None
-                }
-            ],
-            "model": "grok-2-latest",
-            "stream": False,
-            "temperature": 0.7
-        }
+            if response.status_code == 200:
+                return response.json()['choices'][0]['message']['content'].strip()
+            else:
+                print(f"API Error: {response.status_code} - {response.text}")
+                return "Woof! (API Error)"
 
-        response = requests.post(
-            self.grok_api_url,
-            headers=self.headers,
-            json=payload
-        )
-
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content'].strip()
-        else:
-            return "Woof! (API Error)"
+        except Exception as e:
+            print(f"Response generation error: {e}")
+            return "Woof! (Error processing response)"
 
     async def dog_reaction(self, perception):
         """React like a dog to what's seen"""
@@ -387,13 +420,16 @@ Keep responses under 50 words and maintain your cheerful personality!""",
             await asyncio.sleep(2.5)
             await self.send_command("DS")
             await self.send_command("DS")
+
+        elif command == "tiny_forward":
+            await self.send_command("forward")
+            await asyncio.sleep(1.0)
             await self.send_command("DS")
 
         elif command.startswith("speak:"):
             text = command.split("speak:")[1].strip()
             print(f"*Speaking: {text}*")
-            await self.send_command_multiple("speak", times=2)
-            await self.send_command(f"speak: {text}")
+            await self.send_command(f"speak:{text}")
 
         elif command == "backward":
             await self.send_command("backward")
@@ -401,14 +437,34 @@ Keep responses under 50 words and maintain your cheerful personality!""",
             await asyncio.sleep(2.5)
             await self.send_command("DS")
             await self.send_command("DS")
+
+        elif command == "tiny_backward":
+            await self.send_command("backward")
+            await asyncio.sleep(1.0)
             await self.send_command("DS")
 
-        elif command in ["left", "right"]:
+        elif command == "left":
             await self.send_command(command)
             await self.send_command(command)
             await asyncio.sleep(2.3)
             await self.send_command("TS")
             await self.send_command("TS")
+
+        elif command == "little_left":
+            await self.send_command("left")
+            await asyncio.sleep(1.0)
+            await self.send_command("TS")
+
+        elif command == "right":
+            await self.send_command(command)
+            await self.send_command(command)
+            await asyncio.sleep(2.3)
+            await self.send_command("TS")
+            await self.send_command("TS")
+
+        elif command == "little_right":
+            await self.send_command("right")
+            await asyncio.sleep(1.0)
             await self.send_command("TS")
 
         # Special actions
@@ -436,98 +492,84 @@ Keep responses under 50 words and maintain your cheerful personality!""",
             look_dir = random.choice(["lookright", "lookleft"])
             await self.movement_sequence(look_dir, duration=1.0, stop_command="LRstop")
             
-    async def generate_response(self, text, frame=None):
-        """Generate a response using X.AI API"""
-        try:
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!
-Be concise, witty, and maintain your cheerful personality!"""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Respond to this in under 50 words: {text}",
-                        "image": self.image_base64 if self.image_base64 else None
-                    }
-                ],
-                "model": "grok-2-vision-latest",
-                "stream": False,
-                "temperature": 0.7
-            }
-
-            response = requests.post(
-                self.grok_api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30  # Added timeout
-            )
-
-            if response.status_code == 200:
-                print(f"Raw API response: {response.json()}")  # Debug line
-                return response.json()['choices'][0]['message']['content'].strip()
-            else:
-                print(f"API Error: {response.status_code} - {response.text}")  # Debug line
-                return "Woof! (API Error)"
-
-        except Exception as e:
-            print(f"Response generation error: {e}")
-            return "Woof! (Error processing response)"
-
     async def run(self):
-            """Main dog brain loop"""
-            try:
-                video_thread = threading.Thread(target=self.capture_video)
-                voice_thread = threading.Thread(target=self.listen_for_voice)
-                video_thread.start()
-                voice_thread.start()
-                
-                print("Dog brain activated! Press Ctrl+C to stop.")
-                print("Speak to your robo-dog!")
+        """Main dog brain loop"""
+        try:
+            video_thread = threading.Thread(target=self.capture_video)
+            voice_thread = threading.Thread(target=self.listen_for_voice)
+            video_thread.start()
+            voice_thread.start()
+            
+            print("Dog brain activated! Press Ctrl+C to stop.")
+            print("Speak to your robo-dog!")
 
-                # Initial startup behavior
-                print("🐕 Waking up and stretching!")
-                await self.send_command("speak:Hello! I'm awake!")
+            # Wait for some initial frames to be captured
+            wait_start = time.time()
+            frame_received = False
+            
+            while time.time() - wait_start < 10 and not frame_received:
+                if not self.frame_queue.empty():
+                    frame_received = True
+                    print("First video frame received!")
+                    break
+                print("Waiting for first video frame...")
+                await asyncio.sleep(1)
+            
+            # Initial startup behavior
+            print("🐕 Waking up and stretching!")
+            await self.send_command("speak:Hello! I'm awake!")
+            
+            if frame_received:
                 frame = self.frame_queue.get()
                 perception = await self.analyze_frame(frame)
                 if perception:
                     await self.dog_reaction(perception)
-                                
-                last_visual_processing_time = 0
-                process_interval = random.uniform(2.5, 3.5)  # Random interval
-
-                while self.running:
-                    # Process voice commands first
-                    current_time = time.time()
-                    
-                    while not self.voice_queue.empty():
-                        command = self.voice_queue.get()
-                        await self.process_voice_command(command)
-                        await asyncio.sleep(0.1)
-                    
-                    # Then process visual input
-                    if current_time - last_visual_processing_time >= 30:
-                        if not self.frame_queue.empty():
-                            frame = self.frame_queue.get()
-                            perception = await self.analyze_frame(frame)
-                            if perception:
-                                await self.dog_reaction(perception)
+            else:
+                print("No video frames received during startup. Continuing without vision.")
                             
-                    # Update the last processing time
-                    last_visual_processing_time = current_time
-                    
-                    await asyncio.sleep(0.1)
+            last_visual_processing_time = 0
+            visual_process_interval = 10  # Process visual input every 10 seconds
 
-            except KeyboardInterrupt:
-                print("\nPutting the dog to sleep...")
-            finally:
-                self.running = False
-                video_thread.join()
-                voice_thread.join()
+            while self.running:
+                # Process voice commands first
+                current_time = time.time()
+                
+                while not self.voice_queue.empty():
+                    command = self.voice_queue.get()
+                    await self.process_voice_command(command)
+                    await asyncio.sleep(0.1)
+                
+                # Then process visual input every 10 seconds
+                if current_time - last_visual_processing_time >= visual_process_interval:
+                    if not self.frame_queue.empty():
+                        print(f"Processing visual input (interval: {visual_process_interval}s)")
+                        frame = self.frame_queue.get()
+                        perception = await self.analyze_frame(frame)
+                        if perception:
+                            await self.dog_reaction(perception)
+                        last_visual_processing_time = current_time
+                
+                await asyncio.sleep(0.1)
+
+        except KeyboardInterrupt:
+            print("\nPutting the dog to sleep...")
+        finally:
+            self.running = False
+            video_thread.join()
+            voice_thread.join()
 
 if __name__ == "__main__":
-    ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')  # Your robot's IP
-    GROK_API_KEY = os.getenv('GROK_API_KEY') # Your Grok API key
+    from dotenv import load_dotenv
+    load_dotenv()  
+    
+    ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')
+    GROK_API_KEY = os.getenv('GROK_API_KEY')
+    
+    if not ROBOT_IP:
+        ROBOT_IP = input("Enter your robot's IP address: ")
+    if not GROK_API_KEY:
+        GROK_API_KEY = input("Enter your Grok API key: ")
+        
+    print(f"Starting DogBrain with Robot IP: {ROBOT_IP}")
     brain = DogBrain(ROBOT_IP, GROK_API_KEY)
     asyncio.run(brain.run())
