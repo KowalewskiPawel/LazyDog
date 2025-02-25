@@ -6,20 +6,20 @@ import base64
 import threading
 import random
 from queue import Queue
-import requests
 import time
 import speech_recognition as sr
 import os
+import anthropic
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class DogBrain:
-    def __init__(self, robot_ip, grok_api_key):
+    def __init__(self, robot_ip, claude_api_key):
         self.robot_ip = robot_ip
         self.ws_url = f"ws://{robot_ip}:8888"
         self.video_url = f"http://{robot_ip}:5000/video_feed"
         self.websocket = None
         self.running = True
-        self.frame_queue = Queue(maxsize=5)  # Increased to store more frames
+        self.frame_queue = Queue(maxsize=5)  # Store more frames
         self.last_action = None
         self.action_count = 0
         self.recognizer = sr.Recognizer()
@@ -29,15 +29,16 @@ class DogBrain:
         self.last_frame_time = 0
         self.frame_capture_success = False
         
-        # X.AI (Grok) API configuration
-        self.grok_api_key = grok_api_key
-        self.grok_api_url = "https://api.x.ai/v1/chat/completions"
-        self.headers = {
-            "Authorization": f"Bearer {grok_api_key}",
-            "Content-Type": "application/json"
-        }
+        # Claude client initialization
+        self.claude_api_key = claude_api_key
+        self.client = anthropic.Anthropic(api_key=claude_api_key)
+        
+        # Use Claude 3.7 Sonnet model
+        self.claude_model = "claude-3-7-sonnet-20250219"
+        
         print(f"Dog brain initializing with Robot IP: {robot_ip}")
         print(f"Video URL set to: {self.video_url}")
+        print(f"Using Claude model: {self.claude_model}")
         print("Dog brain ready to explore!")
 
     async def send_command_multiple(self, command, times=3, delay=0.1):
@@ -115,7 +116,6 @@ class DogBrain:
         response = await self.generate_response(text)
         await self.send_command(f"speak:{response}")
         return True
-
 
     async def execute_command(self, command):
         """Execute commands with proper timing and repetition"""
@@ -289,74 +289,105 @@ class DogBrain:
         return None
 
     async def analyze_frame(self, frame):
-        """Look at scene through dog's eyes using X.AI API"""
+        """Look at scene through dog's eyes using Claude API"""
         try:
             # Convert frame to base64
             _, buffer = cv2.imencode('.jpg', frame)
             image_base64 = base64.b64encode(buffer).decode('utf-8')
             self.image_base64 = image_base64
             
-            # Prepare message for X.AI with vision support
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": """You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! 
-You're playful, energetic, and always eager to interact with your environment."""
-                    },
-                    {
-                        "role": "user",
-                        "content": """Looking at this image, respond with either:
-1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake
-2. An observation starting with "speak:"
-
-Be active and engaging! Mix different movements and share your excitement about what you see!""",
-                        "image": image_base64
-                    }
-                ],
-                "model": "grok-2-vision-latest",  # Explicitly use the vision model
-                "stream": False,
-                "temperature": 0.9
-            }
-
-            print("Sending image to Grok API for analysis...")
-            # Make API call
-            response = requests.post(
-                self.grok_api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30  # Added timeout
-            )
+            print("Sending image to Claude API for analysis...")
             
-            if response.status_code == 200:
-                analysis = response.json()['choices'][0]['message']['content'].lower()
+            try:
+                # Create message with text and image content
+                message = self.client.messages.create(
+                    model=self.claude_model,
+                    max_tokens=1024,
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": image_base64
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                )
+                
+                analysis = message.content[0].text.lower()
                 print(f"Vision API response received!")
+                print(f"Raw response: {analysis}")
                 
-                # Add randomness to encourage exploration
-                if self.last_action == analysis.strip():
-                    self.action_count += 1
-                    if self.action_count >= 2:
-                        print("🐕 Getting bored, trying something new!")
-                        actions = ["forward", "backward", "left", "right", "bark", "jump", "handshake"]
-                        analysis = random.choice(actions)
-                        self.action_count = 0
-                else:
-                    self.last_action = analysis.strip()
+            except Exception as e:
+                print(f"Error with model {self.claude_model}: {e}")
+                print("Attempting with alternative model claude-3-opus-20240229...")
+                
+                # Fallback to another model if available
+                message = self.client.messages.create(
+                    model="claude-3-opus-20240229",
+                    max_tokens=1024,
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": image_base64
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                )
+                
+                analysis = message.content[0].text.lower()
+                print(f"Vision API response received from fallback model!")
+                print(f"Raw response: {analysis}")
+                
+                # Update the model for future calls if successful
+                self.claude_model = "claude-3-opus-20240229"
+                print(f"Updated model to: {self.claude_model}")
+            
+            # Add randomness to encourage exploration
+            if self.last_action == analysis.strip():
+                self.action_count += 1
+                if self.action_count >= 2:
+                    print("🐕 Getting bored, trying something new!")
+                    actions = ["forward", "backward", "left", "right", "bark", "jump", "handshake"]
+                    analysis = random.choice(actions)
                     self.action_count = 0
-                
-                # Random chance to get excited
-                if random.random() < 0.15:
-                    actions = ["bark", "jump", "handshake", "left", "right"]
-                    surprise_action = random.choice(actions)
-                    print("🐕 Ooh! Something caught my attention!")
-                    return surprise_action
-                
-                print(f"🐕 I see: {analysis}")
-                return analysis
-                
             else:
-                print(f"API Error: {response.status_code} - {response.text}")
-                return None
+                self.last_action = analysis.strip()
+                self.action_count = 0
+            
+            # Random chance to get excited
+            if random.random() < 0.15:
+                actions = ["bark", "jump", "handshake", "left", "right"]
+                surprise_action = random.choice(actions)
+                print("🐕 Ooh! Something caught my attention!")
+                return surprise_action
+            
+            print(f"🐕 I see: {analysis}")
+            return analysis
                 
         except Exception as e:
             print(f"Analysis error: {e}")
@@ -365,38 +396,62 @@ Be active and engaging! Mix different movements and share your excitement about 
             return None
 
     async def generate_response(self, text, frame=None):
-        """Generate a response using X.AI API"""
+        """Generate a response using Claude API"""
         try:
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": """You are a cheerful and adventurous robo-dog who loves exploring the world!
-Be concise, witty, and maintain your cheerful personality!"""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Respond to this in under 50 words: {text}",
-                        "image": self.image_base64 if self.image_base64 else None
+            # Prepare content with or without image
+            content = [
+                {
+                    "type": "text",
+                    "text": f"Respond to this in under 50 words: {text}"
+                }
+            ]
+            
+            # Add image if available
+            if self.image_base64:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": self.image_base64
                     }
-                ],
-                "model": "grok-2-vision-latest",  # Explicitly use the vision model
-                "stream": False,
-                "temperature": 0.7
-            }
-
-            response = requests.post(
-                self.grok_api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30  # Added timeout
-            )
-
-            if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content'].strip()
-            else:
-                print(f"API Error: {response.status_code} - {response.text}")
-                return "Woof! (API Error)"
+                })
+            
+            try:
+                # Create message with Claude client
+                message = self.client.messages.create(
+                    model=self.claude_model,
+                    max_tokens=1024,
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
+                )
+            except Exception as e:
+                print(f"Error with model {self.claude_model}: {e}")
+                print("Attempting with alternative model claude-3-opus-20240229...")
+                
+                # Fallback to another model
+                message = self.client.messages.create(
+                    model="claude-3-opus-20240229",
+                    max_tokens=1024,
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
+                )
+                
+                # Update model for future calls
+                self.claude_model = "claude-3-opus-20240229"
+                print(f"Updated model to: {self.claude_model}")
+            
+            return message.content[0].text.strip()
 
         except Exception as e:
             print(f"Response generation error: {e}")
@@ -409,6 +464,20 @@ Be concise, witty, and maintain your cheerful personality!"""
 
         command = perception.strip().lower()
         print(f"🐕 Doing: {command}")
+
+        # Extract command from text if it contains multiple words
+        for cmd in ["forward", "tiny_forward", "backward", "tiny_backward", "left", "little_left", 
+                   "right", "little_right", "jump", "handshake", "bark", "steady"]:
+            if cmd in command:
+                command = cmd
+                break
+
+        # Check if it's a speak command
+        if "speak:" in command:
+            text = command.split("speak:")[1].strip()
+            print(f"*Speaking: {text}*")
+            await self.send_command(f"speak:{text}")
+            return
 
         # Add random chance for extra bark
         should_bark = random.random() < 0.2  # 20% chance to add bark
@@ -425,11 +494,6 @@ Be concise, witty, and maintain your cheerful personality!"""
             await self.send_command("forward")
             await asyncio.sleep(1.0)
             await self.send_command("DS")
-
-        elif command.startswith("speak:"):
-            text = command.split("speak:")[1].strip()
-            print(f"*Speaking: {text}*")
-            await self.send_command(f"speak:{text}")
 
         elif command == "backward":
             await self.send_command("backward")
@@ -563,13 +627,13 @@ if __name__ == "__main__":
     load_dotenv()  
     
     ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')
-    GROK_API_KEY = os.getenv('GROK_API_KEY')
+    CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY')
     
     if not ROBOT_IP:
         ROBOT_IP = input("Enter your robot's IP address: ")
-    if not GROK_API_KEY:
-        GROK_API_KEY = input("Enter your Grok API key: ")
+    if not CLAUDE_API_KEY:
+        CLAUDE_API_KEY = input("Enter your Claude API key: ")
         
     print(f"Starting DogBrain with Robot IP: {ROBOT_IP}")
-    brain = DogBrain(ROBOT_IP, GROK_API_KEY)
+    brain = DogBrain(ROBOT_IP, CLAUDE_API_KEY)
     asyncio.run(brain.run())
