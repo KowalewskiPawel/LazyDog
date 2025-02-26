@@ -1,250 +1,266 @@
+#!/usr/bin/env python3
+# Enhanced Robot Watchdog with Claude Vision Integration
+# This version adds Claude AI to detect and identify intruders
+# Plus patrol capabilities, barking, and enhanced movements
+
+import cv2
+import time
 import asyncio
 import websockets
-import cv2
 import json
-import base64
-import threading
 import random
-from queue import Queue
-import time
-import speech_recognition as sr
+import threading
 import os
-import anthropic
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import datetime
+import argparse
+import numpy as np
+from queue import Queue
+import base64
+import sys
+import anthropic  # pip install anthropic
+from dotenv import load_dotenv
 
-class DogBrain:
-    def __init__(self, robot_ip, claude_api_key):
+class RobotWatchdogAI:
+    def __init__(self, robot_ip, claude_api_key=None):
+        # Robot connection settings
         self.robot_ip = robot_ip
         self.ws_url = f"ws://{robot_ip}:8888"
         self.video_url = f"http://{robot_ip}:5000/video_feed"
         self.websocket = None
+        
+        # Watchdog settings
         self.running = True
-        self.frame_queue = Queue(maxsize=5)  # Store more frames
-        self.last_action = None
-        self.action_count = 0
-        self.recognizer = sr.Recognizer()
-        self.voice_queue = Queue()
-        self.last_voice_input = None
-        self.image_base64 = ''
-        self.last_frame_time = 0
-        self.frame_capture_success = False
+        self.watchdog_enabled = False
+        self.alerts_enabled = True
+        self.is_alerting = False
+        self.consecutive_detections = 0
+        self.detection_threshold_count = 3  # How many detections to trigger alert
+        self.detection_threshold = 2000  # Minimum contour area for motion detection
+        self.detection_cooldown = 30  # Seconds between alerts
+        self.last_alert_time = 0
+        self.last_motion_time = 0
+        self.motion_detected = False
+        self.motion_area = None
         
-        # Claude client initialization
+        # New patrol mode settings
+        self.patrol_mode = False
+        self.patrol_thread = None
+        self.patrol_interval = 60  # Time between patrol movements in seconds
+        self.last_patrol_time = 0
+        self.patrol_sequence = ["forward", "left", "forward", "right", "forward"]
+        self.patrol_index = 0
+        self.patrol_random = True  # Use random movements for patrol
+        
+        # AI vision settings
         self.claude_api_key = claude_api_key
-        self.client = anthropic.Anthropic(api_key=claude_api_key)
+        self.claude_client = None
+        self.claude_model = "claude-3-7-sonnet-20250219"  # Can fall back to other models
+        self.ai_enabled = claude_api_key is not None
+        self.last_vision_analysis_time = 0
+        self.vision_analysis_interval = 15  # Seconds between vision analysis
+        self.detected_objects = []
+        self.detected_people = []
+        self.detected_vehicles = []
+        self.intruder_description = ""
         
-        # Use Claude 3.7 Sonnet model
-        self.claude_model = "claude-3-7-sonnet-20250219"
+        # Background model for motion detection
+        self.avg = None
         
-        print(f"Dog brain initializing with Robot IP: {robot_ip}")
-        print(f"Video URL set to: {self.video_url}")
-        print(f"Using Claude model: {self.claude_model}")
-        print("Dog brain ready to explore!")
-
-    async def send_command_multiple(self, command, times=3, delay=0.1):
-        """Send a command multiple times with delay to ensure it's received"""
-        responses = []
-        for _ in range(times):
-            response = await self.send_command(command)
-            responses.append(response)
-            await asyncio.sleep(delay)
-        return responses
-
-    async def movement_sequence(self, command, duration=2.0, stop_command="DS"):
-        """Execute a movement with proper start and stop sequence"""
-        # Send movement command multiple times
-        await self.send_command_multiple(command, times=3)
+        # Frame processing
+        self.frame_queue = Queue(maxsize=10)
+        self.recent_frames = []  # Store recent frames for recording
+        self.max_recent_frames = 50  # Max number of frames to keep
         
-        # Random variation in movement duration
-        actual_duration = duration + random.uniform(-0.5, 0.5)
-        await asyncio.sleep(actual_duration)
+        # Warning messages
+        self.generic_warnings = [
+            "Intruder detected! The police has been notified.",
+            "Warning! This area is under surveillance.",
+            "Security alert! The homeowner has been notified.",
+            "Unauthorized access detected! Security system activated.",
+            "This is a security robot. Please identify yourself."
+        ]
         
-        # Send stop command multiple times
-        await self.send_command_multiple(stop_command, times=3)
+        # Bark sounds
+        self.bark_sounds = [
+            "Woof woof! Intruder alert!",
+            "Bark! Bark! Security breach!",
+            "Woof! You are being monitored!",
+            "Bark bark! This area is protected!"
+        ]
+        self.last_message_index = -1
         
-        # Small pause after movement
-        await asyncio.sleep(0.2)
-
-    async def bark_sequence(self, intensity="normal"):
-        """Execute a bark with variable patterns"""
-        patterns = {
-            "short": [(0.1, 0.1)],
-            "normal": [(0.2, 0.1), (0.2, 0.1)],
-            "excited": [(0.1, 0.05), (0.1, 0.05), (0.2, 0.1)],
-            "alert": [(0.3, 0.1), (0.1, 0.05), (0.1, 0.05)]
-        }
+        # Create folder for saving detection images
+        self.save_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "intruder_images")
+        os.makedirs(self.save_dir, exist_ok=True)
         
-        pattern = patterns.get(intensity, patterns["normal"])
-        for duration, pause in pattern:
-            await self.send_command_multiple("bark", times=2)
-            await asyncio.sleep(duration)
-            await self.send_command_multiple("bark", times=2)
-            await asyncio.sleep(pause)
-            
-    async def process_voice_command(self, text):
-        """Process voice commands directly"""
-        text = text.lower().strip()
-        print(f"🎯 Processing: {text}")
+        # Initialize Claude client if API key provided
+        if self.claude_api_key:
+            self.claude_client = anthropic.Anthropic(api_key=self.claude_api_key)
+            print(f"Claude API initialized with model: {self.claude_model}")
         
-        # Direct command mapping
-        commands = {
-            "forward": ["come", "forward", "go", "move"],
-            "backward": ["back", "backward", "retreat"],
-            "left": ["left", "turn left"],
-            "right": ["right", "turn right"],
-            "jump": ["jump", "hop", "up"],
-            "handshake": ["shake", "paw", "hand"],
-            "bark": ["bark", "woof"],
-            "steady": ["steady", "balance", "stabilize"],
-            "stop": ["stop", "halt", "freeze"]
-        }
+        print(f"Robot Watchdog initializing...")
+        print(f"Robot IP: {robot_ip}")
+        print(f"Video stream: {self.video_url}")
+        print(f"WebSocket URL: {self.ws_url}")
+        print(f"AI Vision: {'Enabled' if self.ai_enabled else 'Disabled'}")
         
-        # Check for movement commands
-        for command, triggers in commands.items():
-            if any(word in text for word in triggers):
-                if command == "stop":
-                    await self.send_command("DS")  # Stop forward/backward
-                    await self.send_command("TS")  # Stop turning
-                    return True
-                if command == "steady":
-                    await self.send_command("steady")
-                    return True
-                await self.execute_command(command)
-                return True
-        
-        # If not a command, generate a short response
-        response = await self.generate_response(text)
-        await self.send_command(f"speak:{response}")
-        return True
-
-    async def execute_command(self, command):
-        """Execute commands with proper timing and repetition"""
+    async def connect_websocket(self):
+        """Connect to robot's WebSocket server"""
         try:
-            if command == "forward":
-                for _ in range(3):
-                    await self.send_command(command)
-                await asyncio.sleep(10.0)
-                await self.send_command("DS")
-                
-            elif command == "backward":
-                for _ in range(3):
-                    await self.send_command(command)
-                await asyncio.sleep(8.0)
-                await self.send_command("DS")
-                
-            elif command == "left":
-                for _ in range(2):
-                    await self.send_command(command)
-                await asyncio.sleep(5.5)
-                await self.send_command("TS")
-                
-            elif command == "right":
-                for _ in range(2):
-                    await self.send_command(command)
-                await asyncio.sleep(5.5)
-                await self.send_command("TS")
-                
-            elif command == "little_left":
-                await self.send_command("left")
-                await asyncio.sleep(2.0)
-                await self.send_command("TS")
-                
-            elif command == "little_right":
-                await self.send_command("right")
-                await asyncio.sleep(2.0)
-                await self.send_command("TS")
-                
-            elif command == "tiny_forward":
-                await self.send_command("forward")
-                await asyncio.sleep(3.0)
-                await self.send_command("DS")
-                
-            elif command == "tiny_backward":
-                await self.send_command("backward")
-                await asyncio.sleep(3.0)
-                await self.send_command("DS")
-                
-            elif command in ["jump", "handshake", "bark"]:
-                for _ in range(2):
-                    await self.send_command(command)
-                    await asyncio.sleep(10.5)
-                    
+            self.websocket = await websockets.connect(self.ws_url)
+            await self.websocket.send("admin:123456")
+            response = await self.websocket.recv()
+            print(f"Connected to robot! Response: {response}")
+            return True
         except Exception as e:
-            print(f"Command execution error: {e}")
+            print(f"WebSocket connection error: {e}")
+            self.websocket = None
+            return False
             
-    def listen_for_voice(self):
-        """Listen for voice input in a separate thread"""
-        print("Starting to listen... Speak to your robo-dog!")
-        
-        while self.running:
+    async def send_command(self, command):
+        """Send command to robot via WebSocket"""
+        tries = 3  # Number of connection retries
+        for attempt in range(tries):
             try:
-                with sr.Microphone() as source:
-                    # Only adjust for ambient noise occasionally
-                    if random.random() < 0.1:  # 10% chance to readjust
-                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                    
-                    # Listen without timeout for phrase start
-                    audio = self.recognizer.listen(source, 
-                                                phrase_time_limit=5,  # Max phrase length
-                                                timeout=None)  # No timeout for start
-                    
-                    try:
-                        text = self.recognizer.recognize_google(audio)
-                        if text:  # Only process non-empty results
-                            print(f"\n🎤 Human said: {text}")
-                            self.last_voice_input = text
-                            self.voice_queue.put(text)
-                    except sr.UnknownValueError:
-                        # Silent fail for unrecognized speech
-                        pass
-                    except sr.RequestError as e:
-                        # Only print actual errors
-                        print(f"Speech recognition error: {e}")
+                if self.websocket is None:
+                    await self.connect_websocket()
+                    if self.websocket is None:
+                        time.sleep(1)
+                        continue
                         
-            except KeyboardInterrupt:
-                break
+                await self.websocket.send(command)
+                print(f"Sent command: {command}")
+                return await self.websocket.recv()
             except Exception as e:
-                # Only print non-timeout errors
-                if "timeout" not in str(e).lower():
-                    print(f"Listening error: {e}")
-                continue
-
+                print(f"Command error (attempt {attempt + 1}/{tries}): {e}")
+                self.websocket = None
+                if attempt < tries - 1:
+                    await asyncio.sleep(1)  # Wait before retry
+        return None
+    
+    async def send_speak_command(self, text):
+        """Send a speak command to the robot"""
+        try:
+            # Construct JSON response for speak command
+            response = {"status": "ok", "title": "speak", "data": text}
+            response_json = json.dumps(response)
+            
+            # Send the command
+            return await self.send_command(response_json)
+        except Exception as e:
+            print(f"Speak command error: {e}")
+            return None
+    
+    async def bark(self):
+        """Make the robot bark like a dog"""
+        try:
+            # Use jump as a physical "bark" action
+            await self.send_command("jump")
+            
+            # Select random bark sound
+            bark_sound = random.choice(self.bark_sounds)
+            
+            # Make the robot "speak" the bark
+            await self.send_speak_command(bark_sound)
+            
+            # Flash lights quickly during bark
+            await self.send_command("lightCtrl('red', 0)")
+            await asyncio.sleep(0.2)
+            await self.send_command("lightCtrl('blue', 0)")
+            await asyncio.sleep(0.2)
+            await self.send_command("lightCtrl('red', 0)")
+            
+            print(f"Robot barked: {bark_sound}")
+            
+        except Exception as e:
+            print(f"Bark error: {e}")
+    
+    async def perform_movement(self, movement, duration=1.0):
+        """Perform a movement with proper start and stop commands"""
+        try:
+            move_commands = {
+                "forward": {"start": "forward", "stop": "DS"},
+                "backward": {"start": "backward", "stop": "DS"},
+                "left": {"start": "left", "stop": "TS"},
+                "right": {"start": "right", "stop": "TS"},
+                "lookLeft": {"start": "lookLeft", "stop": "LRstop"},
+                "lookRight": {"start": "lookRight", "stop": "LRstop"},
+                "lookUp": {"start": "up", "stop": "UDstop"},
+                "lookDown": {"start": "down", "stop": "UDstop"}
+            }
+            
+            if movement in move_commands:
+                # Send the start command multiple times for reliability
+                for _ in range(3):
+                    await self.send_command(move_commands[movement]["start"])
+                    await asyncio.sleep(0.1)
+                
+                # Wait for the specified duration
+                await asyncio.sleep(duration)
+                
+                # Send the stop command
+                await self.send_command(move_commands[movement]["stop"])
+                
+                print(f"Performed movement: {movement} for {duration}s")
+            elif movement == "jump":
+                await self.send_command("jump")
+                print("Performed jump")
+            elif movement == "handshake":
+                await self.send_command("handshake")
+                print("Performed handshake")
+            elif movement == "steady":
+                await self.send_command("steady")
+                print("Performed steady mode")
+            else:
+                print(f"Unknown movement: {movement}")
+                
+        except Exception as e:
+            print(f"Movement error: {e}")
+        
     def capture_video(self):
-        """Capture video frames in a separate thread"""
-        print(f"Starting dog vision... Connecting to {self.video_url}")
+        """Capture video frames from robot's stream"""
+        print(f"Starting video capture from {self.video_url}")
+        
         retry_count = 0
-        max_retries = 5
+        max_retries = 10
         
         while self.running and retry_count < max_retries:
             try:
+                # Open video stream
                 cap = cv2.VideoCapture(self.video_url)
                 if not cap.isOpened():
-                    print(f"Failed to open video stream at {self.video_url}, retrying...")
+                    print(f"Failed to open video stream, retrying ({retry_count+1}/{max_retries})...")
                     retry_count += 1
                     time.sleep(2)
                     continue
                 
                 print("Video stream successfully opened!")
-                self.frame_capture_success = True
-                retry_count = 0  # Reset retry count on success
+                retry_count = 0  # Reset on success
                 
+                # Process frames
                 while self.running:
                     ret, frame = cap.read()
-                    if ret:
-                        # Clear queue if full
-                        if self.frame_queue.full():
-                            try:
-                                self.frame_queue.get_nowait()
-                            except:
-                                pass
-                        self.frame_queue.put(frame)
-                        self.last_frame_time = time.time()
-                    else:
+                    if not ret:
                         print("Failed to read frame, reconnecting...")
                         break
-                        
+                    
+                    # Store frame in queue
+                    if not self.frame_queue.full():
+                        self.frame_queue.put(frame)
+                    else:
+                        try:
+                            self.frame_queue.get_nowait()  # Remove old frame
+                            self.frame_queue.put(frame)
+                        except:
+                            pass
+                    
+                    # Keep a list of recent frames (for recording)
+                    self.recent_frames.append(frame.copy())
+                    if len(self.recent_frames) > self.max_recent_frames:
+                        self.recent_frames.pop(0)
+                    
                     # Throttle capture rate
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     
             except Exception as e:
                 print(f"Video capture error: {e}")
@@ -255,385 +271,608 @@ class DogBrain:
                     cap.release()
                 except:
                     pass
-                
-        if retry_count >= max_retries:
-            print("Maximum video capture retries reached. Vision may not be available.")
-            self.frame_capture_success = False
-
-    async def connect_websocket(self):
-        """Connect to robot's body"""
-        try:
-            self.websocket = await websockets.connect(self.ws_url)
-            await self.websocket.send("admin:123456")
-            response = await self.websocket.recv()
-            print(f"Connected! Response: {response}")
-            return True
-        except Exception as e:
-            print(f"Connection error: {e}")
+                    
+        print("Video capture stopped")
+    
+    def detect_motion(self, frame):
+        """Detect motion in the frame using background subtraction"""
+        if not self.watchdog_enabled:
             return False
-
-    async def send_command(self, command):
-        """Send command to robot's body"""
-        tries = 3  # Number of connection retries
-        for attempt in range(tries):
-            try:
-                if self.websocket is None:
-                    await self.connect_websocket()
-                await self.websocket.send(command)
-                return await self.websocket.recv()
-            except Exception as e:
-                print(f"Command error (attempt {attempt + 1}/{tries}): {e}")
-                self.websocket = None
-                if attempt < tries - 1:
-                    await asyncio.sleep(1)  # Wait before retry
-        return None
-
-    async def analyze_frame(self, frame):
-        """Look at scene through dog's eyes using Claude API"""
+            
         try:
-            # Convert frame to base64
-            _, buffer = cv2.imencode('.jpg', frame)
-            image_base64 = base64.b64encode(buffer).decode('utf-8')
-            self.image_base64 = image_base64
+            # Convert to grayscale and blur
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
             
-            print("Sending image to Claude API for analysis...")
+            # Initialize background model if needed
+            if self.avg is None:
+                print("Initializing background model...")
+                self.avg = gray.copy().astype("float")
+                return False
+                
+            # Update background model
+            cv2.accumulateWeighted(gray, self.avg, 0.5)
             
-            try:
-                # Create message with text and image content
-                message = self.client.messages.create(
-                    model=self.claude_model,
-                    max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
-                                },
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/jpeg",
-                                        "data": image_base64
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                )
-                
-                analysis = message.content[0].text.lower()
-                print(f"Vision API response received!")
-                print(f"Raw response: {analysis}")
-                
-            except Exception as e:
-                print(f"Error with model {self.claude_model}: {e}")
-                print("Attempting with alternative model claude-3-opus-20240229...")
-                
-                # Fallback to another model if available
-                message = self.client.messages.create(
-                    model="claude-3-opus-20240229",
-                    max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
-                                },
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/jpeg",
-                                        "data": image_base64
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                )
-                
-                analysis = message.content[0].text.lower()
-                print(f"Vision API response received from fallback model!")
-                print(f"Raw response: {analysis}")
-                
-                # Update the model for future calls if successful
-                self.claude_model = "claude-3-opus-20240229"
-                print(f"Updated model to: {self.claude_model}")
+            # Compute difference between current frame and background
+            frameDelta = cv2.absdiff(gray, cv2.convertScaleAbs(self.avg))
             
-            # Add randomness to encourage exploration
-            if self.last_action == analysis.strip():
-                self.action_count += 1
-                if self.action_count >= 2:
-                    print("🐕 Getting bored, trying something new!")
-                    actions = ["forward", "backward", "left", "right", "bark", "jump", "handshake"]
-                    analysis = random.choice(actions)
-                    self.action_count = 0
+            # Threshold the delta image and dilate to fill holes
+            thresh = cv2.threshold(frameDelta, 25, 255, cv2.THRESH_BINARY)[1]
+            thresh = cv2.dilate(thresh, None, iterations=2)
+            
+            # Find contours
+            contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Check for significant motion
+            motion_detected = False
+            largest_area = 0
+            largest_contour = None
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > self.detection_threshold:
+                    if area > largest_area:
+                        largest_area = area
+                        largest_contour = contour
+                    motion_detected = True
+            
+            # Update motion status
+            prev_motion = self.motion_detected
+            self.motion_detected = motion_detected
+            
+            if motion_detected and largest_contour is not None:
+                # Get bounding box of motion area
+                self.motion_area = cv2.boundingRect(largest_contour)
+                self.last_motion_time = time.time()
+                
+                # Update consecutive detections
+                self.consecutive_detections += 1
+                
+                # Check if we should trigger alert
+                if (self.consecutive_detections >= self.detection_threshold_count and 
+                        self.alerts_enabled and not self.is_alerting):
+                    
+                    # If AI is enabled, analyze the image first
+                    if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
+                        # Run vision analysis in separate thread to avoid blocking
+                        analysis_thread = threading.Thread(
+                            target=lambda: asyncio.run(self.analyze_frame_with_claude(frame.copy()))
+                        )
+                        analysis_thread.daemon = True
+                        analysis_thread.start()
+                    else:
+                        # Trigger alert without vision analysis
+                        asyncio.run(self.trigger_alert())
+                    
+                # Draw motion area on frame
+                x, y, w, h = self.motion_area
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, "Motion Detected", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Save frame if motion was just detected
+                if not prev_motion:
+                    self.save_detection_image(frame)
             else:
-                self.last_action = analysis.strip()
-                self.action_count = 0
+                # Reset consecutive detections after 3 seconds of no motion
+                if time.time() - self.last_motion_time > 3:
+                    self.consecutive_detections = 0
             
-            # Random chance to get excited
-            if random.random() < 0.15:
-                actions = ["bark", "jump", "handshake", "left", "right"]
-                surprise_action = random.choice(actions)
-                print("🐕 Ooh! Something caught my attention!")
-                return surprise_action
+            return motion_detected
             
-            print(f"🐕 I see: {analysis}")
-            return analysis
-                
         except Exception as e:
-            print(f"Analysis error: {e}")
+            print(f"Motion detection error: {e}")
             import traceback
             traceback.print_exc()
-            return None
-
-    async def generate_response(self, text, frame=None):
-        """Generate a response using Claude API"""
+            return False
+    
+    async def analyze_frame_with_claude(self, frame):
+        """Use Claude to analyze the image and identify intruders"""
+        if not self.ai_enabled or self.claude_client is None:
+            return
+            
         try:
-            # Prepare content with or without image
-            content = [
-                {
-                    "type": "text",
-                    "text": f"Respond to this in under 50 words: {text}"
-                }
-            ]
+            print("Analyzing frame with Claude Vision...")
+            self.last_vision_analysis_time = time.time()
             
-            # Add image if available
-            if self.image_base64:
-                content.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": self.image_base64
-                    }
-                })
+            # Convert frame to base64 for Claude API
+            _, buffer = cv2.imencode('.jpg', frame)
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
             
+            # Create message with Claude client
             try:
-                # Create message with Claude client
-                message = self.client.messages.create(
+                message = self.claude_client.messages.create(
                     model=self.claude_model,
                     max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
+                    system="You are a security system that identifies potential intruders or unusual activity. Describe what you see accurately and concisely. Focus on people, vehicles, or suspicious activities.",
                     messages=[
                         {
                             "role": "user",
-                            "content": content
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": """Analyze this security camera image and tell me if you see any people, vehicles, or suspicious activity. 
+                                    
+If you see a person, describe them briefly (clothing, appearance).
+If you see a vehicle, describe its type and color.
+If you don't see any people or vehicles, just say "No people or vehicles detected."
+
+Keep your response under 50 words."""
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": image_base64
+                                    }
+                                }
+                            ]
                         }
                     ]
                 )
+                
+                analysis = message.content[0].text
+                print(f"Claude analysis: {analysis}")
+                
+                # Update intruder description
+                self.intruder_description = analysis
+                
+                # Trigger alert with the analysis
+                await self.trigger_alert(analysis)
+                
             except Exception as e:
-                print(f"Error with model {self.claude_model}: {e}")
-                print("Attempting with alternative model claude-3-opus-20240229...")
-                
-                # Fallback to another model
-                message = self.client.messages.create(
-                    model="claude-3-opus-20240229",
-                    max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": content
-                        }
-                    ]
-                )
-                
-                # Update model for future calls
-                self.claude_model = "claude-3-opus-20240229"
-                print(f"Updated model to: {self.claude_model}")
+                print(f"Error with Claude API: {e}")
+                # Fall back to regular alert
+                await self.trigger_alert()
             
-            return message.content[0].text.strip()
-
         except Exception as e:
-            print(f"Response generation error: {e}")
-            return "Woof! (Error processing response)"
-
-    async def dog_reaction(self, perception):
-        """React like a dog to what's seen"""
-        if perception is None:
-            return
-
-        command = perception.strip().lower()
-        print(f"🐕 Doing: {command}")
-
-        # Extract command from text if it contains multiple words
-        for cmd in ["forward", "tiny_forward", "backward", "tiny_backward", "left", "little_left", 
-                   "right", "little_right", "jump", "handshake", "bark", "steady"]:
-            if cmd in command:
-                command = cmd
-                break
-
-        # Check if it's a speak command
-        if "speak:" in command:
-            text = command.split("speak:")[1].strip()
-            print(f"*Speaking: {text}*")
-            await self.send_command(f"speak:{text}")
-            return
-
-        # Add random chance for extra bark
-        should_bark = random.random() < 0.2  # 20% chance to add bark
-
-        # Basic movements
-        if command == "forward":
-            await self.send_command("forward")
-            await self.send_command("forward")
-            await asyncio.sleep(2.5)
-            await self.send_command("DS")
-            await self.send_command("DS")
-
-        elif command == "tiny_forward":
-            await self.send_command("forward")
-            await asyncio.sleep(1.0)
-            await self.send_command("DS")
-
-        elif command == "backward":
-            await self.send_command("backward")
-            await self.send_command("backward")
-            await asyncio.sleep(2.5)
-            await self.send_command("DS")
-            await self.send_command("DS")
-
-        elif command == "tiny_backward":
-            await self.send_command("backward")
-            await asyncio.sleep(1.0)
-            await self.send_command("DS")
-
-        elif command == "left":
-            await self.send_command(command)
-            await self.send_command(command)
-            await asyncio.sleep(2.3)
-            await self.send_command("TS")
-            await self.send_command("TS")
-
-        elif command == "little_left":
-            await self.send_command("left")
-            await asyncio.sleep(1.0)
-            await self.send_command("TS")
-
-        elif command == "right":
-            await self.send_command(command)
-            await self.send_command(command)
-            await asyncio.sleep(2.3)
-            await self.send_command("TS")
-            await self.send_command("TS")
-
-        elif command == "little_right":
-            await self.send_command("right")
-            await asyncio.sleep(1.0)
-            await self.send_command("TS")
-
-        # Special actions
-        elif command == "handshake":
-            print("*Excited tail wagging* - A human!")
-            await self.bark_sequence("excited")
-            await self.send_command_multiple("handshake", times=4)
-
-        elif command == "jump":
-            print("*Super excited!*")
-            await self.bark_sequence("excited")
-            await self.send_command_multiple("jump", times=5)
-
-        elif command == "steady":
-            print("*Balancing carefully*")
-            await self.send_command_multiple("steady", times=3)
-
-        elif command == "bark":
-            print("*Barking with personality!*")
-            bark_type = random.choice(["short", "normal", "excited", "alert"])
-            await self.bark_sequence(bark_type)
-
-        # Random chance to look around after action
-        if random.random() < 0.3:  # 30% chance
-            look_dir = random.choice(["lookright", "lookleft"])
-            await self.movement_sequence(look_dir, duration=1.0, stop_command="LRstop")
-            
-    async def run(self):
-        """Main dog brain loop"""
+            print(f"Vision analysis error: {e}")
+            await self.trigger_alert()  # Fall back to regular alert
+    
+    def save_detection_image(self, frame):
+        """Save a detection image to disk"""
         try:
-            video_thread = threading.Thread(target=self.capture_video)
-            voice_thread = threading.Thread(target=self.listen_for_voice)
-            video_thread.start()
-            voice_thread.start()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"intruder_{timestamp}.jpg"
+            filepath = os.path.join(self.save_dir, filename)
             
-            print("Dog brain activated! Press Ctrl+C to stop.")
-            print("Speak to your robo-dog!")
-
-            # Wait for some initial frames to be captured
-            wait_start = time.time()
-            frame_received = False
+            # Add timestamp to the image
+            timestamp_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, timestamp_text, (10, frame.shape[0] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
             
-            while time.time() - wait_start < 10 and not frame_received:
-                if not self.frame_queue.empty():
-                    frame_received = True
-                    print("First video frame received!")
-                    break
-                print("Waiting for first video frame...")
-                await asyncio.sleep(1)
+            # Save image
+            cv2.imwrite(filepath, frame)
+            print(f"Saved detection image to {filepath}")
             
-            # Initial startup behavior
-            print("🐕 Waking up and stretching!")
-            await self.send_command("speak:Hello! I'm awake!")
+            # Save a short video clip if we have enough frames
+            if len(self.recent_frames) > 10:
+                self.save_detection_video(timestamp)
+                
+        except Exception as e:
+            print(f"Error saving detection image: {e}")
             
-            if frame_received:
-                frame = self.frame_queue.get()
-                perception = await self.analyze_frame(frame)
-                if perception:
-                    await self.dog_reaction(perception)
+    def save_detection_video(self, timestamp):
+        """Save a short video of the detection"""
+        try:
+            filename = f"intruder_{timestamp}.mp4"
+            filepath = os.path.join(self.save_dir, filename)
+            
+            # Get video properties from the first frame
+            height, width = self.recent_frames[0].shape[:2]
+            
+            # Create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(filepath, fourcc, 10, (width, height))
+            
+            # Write frames to video
+            for frame in self.recent_frames:
+                out.write(frame)
+                
+            # Release video writer
+            out.release()
+            print(f"Saved detection video to {filepath}")
+            
+        except Exception as e:
+            print(f"Error saving detection video: {e}")
+    
+    async def trigger_alert(self, vision_analysis=None):
+        """Trigger alert when motion is detected"""
+        current_time = time.time()
+        
+        # Only alert if cooldown period has passed
+        if current_time - self.last_alert_time < self.detection_cooldown:
+            return
+            
+        # Mark as alerting and update last alert time
+        self.is_alerting = True
+        self.last_alert_time = current_time
+        
+        # Pause patrol mode during alert
+        was_patrolling = self.patrol_mode
+        if was_patrolling:
+            self.toggle_patrol_mode(False)
+        
+        # Start alert sequence in a separate thread
+        alert_thread = threading.Thread(
+            target=lambda: asyncio.run(self.alert_sequence(vision_analysis, was_patrolling))
+        )
+        alert_thread.daemon = True
+        alert_thread.start()
+    
+    async def alert_sequence(self, vision_analysis=None, resume_patrol=False):
+        """Run the alert sequence"""
+        try:
+            print("⚠️ ALERT! Intruder detected!")
+            
+            # Set red alert light
+            await self.send_command("lightCtrl('red', 0)")
+            
+            # First, make the robot bark like a dog
+            await self.bark()
+            
+            # Sound the alarm
+            await self.send_command("buzzerCtrl(1, 0)")
+            await asyncio.sleep(1.5)
+            await self.send_command("buzzerCtrl(0, 0)")
+            await asyncio.sleep(0.5)
+            await self.send_command("buzzerCtrl(1, 0)")
+            await asyncio.sleep(1.5)
+            await self.send_command("buzzerCtrl(0, 0)")
+            
+            # Prepare warning message
+            warning_message = ""
+            
+            # If we have vision analysis, use it for a more specific warning
+            if vision_analysis and "no people" not in vision_analysis.lower():
+                # Include description in the warning
+                warning_prefix = random.choice([
+                    "Security alert! Detecting ",
+                    "Warning! I can see ",
+                    "Intruder alert! Identified "
+                ])
+                
+                warning_suffix = random.choice([
+                    ". The police have been notified.",
+                    ". Security system activated.",
+                    ". This area is under surveillance."
+                ])
+                
+                warning_message = warning_prefix + vision_analysis.strip() + warning_suffix
             else:
-                print("No video frames received during startup. Continuing without vision.")
-                            
-            last_visual_processing_time = 0
-            visual_process_interval = 10  # Process visual input every 10 seconds
-
-            while self.running:
-                # Process voice commands first
+                # Use generic warning message
+                message_index = random.randrange(len(self.generic_warnings))
+                while message_index == self.last_message_index and len(self.generic_warnings) > 1:
+                    message_index = random.randrange(len(self.generic_warnings))
+                self.last_message_index = message_index
+                warning_message = self.generic_warnings[message_index]
+            
+            # Speak the warning message
+            print(f"Speaking: {warning_message}")
+            await self.send_speak_command(warning_message)
+            
+            # Enhanced movement sequence - make the robot look more alert
+            # Turn head to look for intruder
+            await self.perform_movement("lookLeft", 0.5)
+            await self.perform_movement("lookRight", 0.5)
+            
+            # Turn body to face intruder
+            direction = random.choice(["left", "right"])
+            await self.perform_movement(direction, 0.8)
+            
+            # Bark again after turning
+            await self.bark()
+            
+            # Flash alert lights
+            for _ in range(4):
+                await self.send_command("lightCtrl('red', 0)")
+                await asyncio.sleep(0.7)
+                await self.send_command("lightCtrl('blue', 0)")
+                await asyncio.sleep(0.7)
+            
+            # Return to standby state
+            await self.send_command("lightCtrl('blue', 0)")
+            self.is_alerting = False
+            
+            # Resume patrol if it was active before
+            if resume_patrol:
+                self.toggle_patrol_mode(True)
+            
+        except Exception as e:
+            print(f"Alert sequence error: {e}")
+            self.is_alerting = False
+    
+    def enable_watchdog(self):
+        """Enable watchdog mode"""
+        self.watchdog_enabled = True
+        self.consecutive_detections = 0
+        self.avg = None  # Reset background model
+        print("Watchdog mode enabled")
+        
+    def disable_watchdog(self):
+        """Disable watchdog mode"""
+        self.watchdog_enabled = False
+        self.toggle_patrol_mode(False)  # Also disable patrol mode
+        print("Watchdog mode disabled")
+        
+    def toggle_alerts(self, enable):
+        """Toggle alert system"""
+        self.alerts_enabled = enable
+        print(f"Alerts {'enabled' if enable else 'disabled'}")
+    
+    def toggle_patrol_mode(self, enable):
+        """Toggle patrol mode on/off"""
+        if enable and not self.patrol_mode:
+            self.patrol_mode = True
+            print("Patrol mode enabled")
+            
+            # Start patrol thread if watchdog is enabled
+            if self.watchdog_enabled:
+                self.patrol_thread = threading.Thread(target=lambda: asyncio.run(self.patrol_sequence_loop()))
+                self.patrol_thread.daemon = True
+                self.patrol_thread.start()
+                
+        elif not enable and self.patrol_mode:
+            self.patrol_mode = False
+            print("Patrol mode disabled")
+            
+            # Patrol thread will exit by itself due to the flag check
+            
+    async def patrol_sequence_loop(self):
+        """Run the patrol sequence in a loop"""
+        print("Starting patrol sequence loop")
+        
+        # Define a set of possible patrol movements
+        patrol_movements = [
+            {"movement": "forward", "duration": 1.5},
+            {"movement": "left", "duration": 0.8},
+            {"movement": "right", "duration": 0.8},
+            {"movement": "lookLeft", "duration": 0.5},
+            {"movement": "lookRight", "duration": 0.5}
+        ]
+        
+        # Run patrol loop until patrol mode is disabled
+        while self.running and self.patrol_mode and self.watchdog_enabled and not self.is_alerting:
+            try:
                 current_time = time.time()
                 
-                while not self.voice_queue.empty():
-                    command = self.voice_queue.get()
-                    await self.process_voice_command(command)
-                    await asyncio.sleep(0.1)
+                # Check if it's time for a patrol movement
+                if current_time - self.last_patrol_time >= self.patrol_interval:
+                    print("Performing patrol movement")
+                    self.last_patrol_time = current_time
+                    
+                    # Make a sound to indicate patrol
+                    await self.send_speak_command("Patrolling the area")
+                    
+                    # Choose movement pattern
+                    if self.patrol_random:
+                        # Random patrol pattern
+                        # Pick 2-3 movements
+                        num_movements = random.randint(2, 3)
+                        movements = random.sample(patrol_movements, num_movements)
+                        
+                        # Perform each movement
+                        for move in movements:
+                            # Check if patrol is still active before each movement
+                            if not (self.patrol_mode and self.watchdog_enabled and not self.is_alerting):
+                                break
+                                
+                            await self.perform_movement(move["movement"], move["duration"])
+                            await asyncio.sleep(0.5)  # Pause between movements
+                    else:
+                        # Sequential patrol pattern
+                        if self.patrol_index >= len(self.patrol_sequence):
+                            self.patrol_index = 0
+                            
+                        # Get next movement in sequence
+                        movement = self.patrol_sequence[self.patrol_index]
+                        self.patrol_index += 1
+                        
+                        # Perform the movement
+                        await self.perform_movement(movement, 1.0)
+                    
+                    # Look around after patrol movement
+                    await self.perform_movement("lookLeft", 0.5)
+                    await self.perform_movement("lookRight", 0.5)
                 
-                # Then process visual input every 10 seconds
-                if current_time - last_visual_processing_time >= visual_process_interval:
-                    if not self.frame_queue.empty():
-                        print(f"Processing visual input (interval: {visual_process_interval}s)")
-                        frame = self.frame_queue.get()
-                        perception = await self.analyze_frame(frame)
-                        if perception:
-                            await self.dog_reaction(perception)
-                        last_visual_processing_time = current_time
+                # Sleep for a bit to avoid busy waiting
+                await asyncio.sleep(5)
                 
-                await asyncio.sleep(0.1)
-
+            except Exception as e:
+                print(f"Patrol error: {e}")
+                await asyncio.sleep(5)  # Sleep longer on error
+        
+        print("Patrol sequence loop ended")
+        
+    def process_frames(self):
+        """Process frames in the queue"""
+        print("Starting frame processing...")
+        
+        display_window = True  # Set to False to disable GUI
+        
+        if display_window:
+            cv2.namedWindow("Watchdog Monitor", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Watchdog Monitor", 800, 600)
+        
+        while self.running:
+            try:
+                if not self.frame_queue.empty():
+                    frame = self.frame_queue.get()
+                    
+                    # Skip processing if frame is None
+                    if frame is None:
+                        continue
+                    
+                    # Clone the frame for display
+                    display_frame = frame.copy()
+                    
+                    # Detect motion if watchdog is enabled
+                    if self.watchdog_enabled:
+                        motion = self.detect_motion(display_frame)
+                        
+                        # Add status text
+                        status_text = f"Watchdog: {'ENABLED' if self.watchdog_enabled else 'DISABLED'}"
+                        cv2.putText(display_frame, status_text, (10, 30), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        alert_text = f"Alerts: {'ON' if self.alerts_enabled else 'OFF'}"
+                        cv2.putText(display_frame, alert_text, (10, 60), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        ai_text = f"AI Vision: {'ON' if self.ai_enabled else 'OFF'}"
+                        cv2.putText(display_frame, ai_text, (10, 90), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        patrol_text = f"Patrol Mode: {'ON' if self.patrol_mode else 'OFF'}"
+                        cv2.putText(display_frame, patrol_text, (10, 120), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        if motion:
+                            motion_text = f"Motion Detected! Count: {self.consecutive_detections}"
+                            cv2.putText(display_frame, motion_text, (10, 150), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                        
+                        # Show intruder description if available
+                        if self.intruder_description and self.intruder_description != "No people or vehicles detected.":
+                            # Split into multiple lines if too long
+                            words = self.intruder_description.split()
+                            lines = []
+                            current_line = []
+                            
+                            for word in words:
+                                current_line.append(word)
+                                if len(' '.join(current_line)) > 60:  # Line length limit
+                                    lines.append(' '.join(current_line[:-1]))
+                                    current_line = [word]
+                            
+                            if current_line:
+                                lines.append(' '.join(current_line))
+                                
+                            # Display lines
+                            for i, line in enumerate(lines):
+                                cv2.putText(display_frame, line, (10, 180 + i*30), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    else:
+                        status_text = "Watchdog: DISABLED"
+                        cv2.putText(display_frame, status_text, (10, 30), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    
+                    # Add help text at the bottom
+                    help_text = "Controls: [e]nable/[d]isable watchdog, [a]lerts toggle, [p]atrol toggle, [q]uit"
+                    cv2.putText(display_frame, help_text, (10, display_frame.shape[0] - 20), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Display the frame
+                    if display_window:
+                        cv2.imshow("Watchdog Monitor", display_frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        
+                        # Handle key presses
+                        if key == ord('q'):
+                            self.running = False
+                        elif key == ord('e'):
+                            self.enable_watchdog()
+                        elif key == ord('d'):
+                            self.disable_watchdog()
+                        elif key == ord('a'):
+                            self.toggle_alerts(not self.alerts_enabled)
+                        elif key == ord('p'):
+                            self.toggle_patrol_mode(not self.patrol_mode)
+                        elif key == ord('b'):
+                            # Manual bark for testing
+                            asyncio.run(self.bark())
+                
+                # Sleep briefly to avoid excessive CPU usage
+                time.sleep(0.03)
+                
+            except Exception as e:
+                print(f"Frame processing error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(1)
+        
+        # Clean up
+        if display_window:
+            cv2.destroyAllWindows()
+        print("Frame processing stopped")
+    
+    def run(self):
+        """Main method to run the watchdog"""
+        try:
+            # Start video capture thread
+            video_thread = threading.Thread(target=self.capture_video)
+            video_thread.daemon = True
+            video_thread.start()
+            
+            # Start frame processing
+            print("\nStarting watchdog monitor...")
+            print("Press 'e' to enable watchdog")
+            print("Press 'd' to disable watchdog")
+            print("Press 'a' to toggle alerts")
+            print("Press 'p' to toggle patrol mode")
+            print("Press 'b' to trigger bark (test)")
+            print("Press 'q' to quit")
+            
+            # Process frames (this will block until quit)
+            self.process_frames()
+            
         except KeyboardInterrupt:
-            print("\nPutting the dog to sleep...")
+            print("\nStopping watchdog monitor...")
         finally:
             self.running = False
-            video_thread.join()
-            voice_thread.join()
+            
+            # Set the light back to blue when exiting
+            asyncio.run(self.send_command("lightCtrl('blue', 0)"))
+            
+            # Close WebSocket connection
+            if self.websocket:
+                asyncio.run(self.websocket.close())
+            
+            print("Watchdog monitor stopped")
+
+def main():
+    load_dotenv()  
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Robot Watchdog Monitor with AI Vision")
+    parser.add_argument("--ip", type=str, default=None,
+                        help="Robot IP address (default: from ROBOT_IP_ADDRESS env var)")
+    parser.add_argument("--enable", action="store_true", 
+                        help="Enable watchdog mode on startup")
+    parser.add_argument("--patrol", action="store_true",
+                        help="Enable patrol mode on startup")
+    parser.add_argument("--claude-key", type=str, default=None,
+                        help="Claude API key for vision analysis (default: from CLAUDE_API_KEY env var)")
+    parser.add_argument("--nodisplay", action="store_true",
+                        help="Run without display window (headless mode)")
+    
+    args = parser.parse_args()
+    
+    # Load Claude API key from environment if not provided
+    claude_api_key = args.claude_key
+    if claude_api_key is None:
+        claude_api_key = os.environ.get("CLAUDE_API_KEY")
+    
+    # Load robot IP from environment if not provided
+    robot_ip = args.ip
+    if robot_ip is None:
+        robot_ip = os.environ.get("ROBOT_IP_ADDRESS")
+        if not robot_ip:
+            robot_ip = input("Enter robot IP address: ")
+    
+    # Create and run watchdog
+    watchdog = RobotWatchdogAI(robot_ip, claude_api_key)
+    
+    # Enable watchdog if requested
+    if args.enable:
+        watchdog.enable_watchdog()
+        
+    # Enable patrol mode if requested
+    if args.patrol and args.enable:
+        watchdog.toggle_patrol_mode(True)
+    
+    # Run the watchdog
+    watchdog.run()
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()  
-    
-    ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')
-    CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY')
-    
-    if not ROBOT_IP:
-        ROBOT_IP = input("Enter your robot's IP address: ")
-    if not CLAUDE_API_KEY:
-        CLAUDE_API_KEY = input("Enter your Claude API key: ")
-        
-    print(f"Starting DogBrain with Robot IP: {ROBOT_IP}")
-    brain = DogBrain(ROBOT_IP, CLAUDE_API_KEY)
-    asyncio.run(brain.run())
+    main()
