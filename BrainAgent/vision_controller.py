@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# Enhanced Robot Watchdog with Claude Vision Integration
-# This version adds Claude AI to detect and identify intruders
-# Plus patrol capabilities, barking, and enhanced movements
+# Enhanced Robot Watchdog with correct command syntax
+# Uses proper speak and bark command formats
 
 import cv2
 import time
@@ -79,14 +78,6 @@ class RobotWatchdogAI:
             "Unauthorized access detected! Security system activated.",
             "This is a security robot. Please identify yourself."
         ]
-        
-        # Bark sounds
-        self.bark_sounds = [
-            "Woof woof! Intruder alert!",
-            "Bark! Bark! Security breach!",
-            "Woof! You are being monitored!",
-            "Bark bark! This area is protected!"
-        ]
         self.last_message_index = -1
         
         # Create folder for saving detection images
@@ -138,84 +129,30 @@ class RobotWatchdogAI:
                     await asyncio.sleep(1)  # Wait before retry
         return None
     
-    async def send_speak_command(self, text):
-        """Send a speak command to the robot"""
-        try:
-            # Construct JSON response for speak command
-            response = {"status": "ok", "title": "speak", "data": text}
-            response_json = json.dumps(response)
-            
-            # Send the command
-            return await self.send_command(response_json)
-        except Exception as e:
-            print(f"Speak command error: {e}")
-            return None
+    async def send_command_multiple(self, command, times=3, delay=0.1):
+        """Send a command multiple times with delay to ensure it's received"""
+        responses = []
+        for _ in range(times):
+            response = await self.send_command(command)
+            responses.append(response)
+            await asyncio.sleep(delay)
+        return responses
     
-    async def bark(self):
-        """Make the robot bark like a dog"""
-        try:
-            # Use jump as a physical "bark" action
-            await self.send_command("jump")
-            
-            # Select random bark sound
-            bark_sound = random.choice(self.bark_sounds)
-            
-            # Make the robot "speak" the bark
-            await self.send_speak_command(bark_sound)
-            
-            # Flash lights quickly during bark
-            await self.send_command("lightCtrl('red', 0)")
-            await asyncio.sleep(0.2)
-            await self.send_command("lightCtrl('blue', 0)")
-            await asyncio.sleep(0.2)
-            await self.send_command("lightCtrl('red', 0)")
-            
-            print(f"Robot barked: {bark_sound}")
-            
-        except Exception as e:
-            print(f"Bark error: {e}")
-    
-    async def perform_movement(self, movement, duration=1.0):
-        """Perform a movement with proper start and stop commands"""
-        try:
-            move_commands = {
-                "forward": {"start": "forward", "stop": "DS"},
-                "backward": {"start": "backward", "stop": "DS"},
-                "left": {"start": "left", "stop": "TS"},
-                "right": {"start": "right", "stop": "TS"},
-                "lookLeft": {"start": "lookLeft", "stop": "LRstop"},
-                "lookRight": {"start": "lookRight", "stop": "LRstop"},
-                "lookUp": {"start": "up", "stop": "UDstop"},
-                "lookDown": {"start": "down", "stop": "UDstop"}
-            }
-            
-            if movement in move_commands:
-                # Send the start command multiple times for reliability
-                for _ in range(3):
-                    await self.send_command(move_commands[movement]["start"])
-                    await asyncio.sleep(0.1)
-                
-                # Wait for the specified duration
-                await asyncio.sleep(duration)
-                
-                # Send the stop command
-                await self.send_command(move_commands[movement]["stop"])
-                
-                print(f"Performed movement: {movement} for {duration}s")
-            elif movement == "jump":
-                await self.send_command("jump")
-                print("Performed jump")
-            elif movement == "handshake":
-                await self.send_command("handshake")
-                print("Performed handshake")
-            elif movement == "steady":
-                await self.send_command("steady")
-                print("Performed steady mode")
-            else:
-                print(f"Unknown movement: {movement}")
-                
-        except Exception as e:
-            print(f"Movement error: {e}")
+    async def bark_sequence(self, intensity="normal"):
+        """Execute a bark with variable patterns"""
+        patterns = {
+            "short": [(0.1, 0.1)],
+            "normal": [(0.2, 0.1), (0.2, 0.1)],
+            "excited": [(0.1, 0.05), (0.1, 0.05), (0.2, 0.1)],
+            "alert": [(0.3, 0.1), (0.1, 0.05), (0.1, 0.05)]
+        }
+        
+        pattern = patterns.get(intensity, patterns["normal"])
+        for duration, pause in pattern:
+            await self.send_command_multiple("bark", times=2)
+            await asyncio.sleep(duration)
+            await self.send_command_multiple("bark", times=2)
+            await asyncio.sleep(pause)
         
     def capture_video(self):
         """Capture video frames from robot's stream"""
@@ -509,8 +446,8 @@ Keep your response under 50 words."""
             # Set red alert light
             await self.send_command("lightCtrl('red', 0)")
             
-            # First, make the robot bark like a dog
-            await self.bark()
+            # First, make the robot bark
+            await self.bark_sequence("alert")
             
             # Sound the alarm
             await self.send_command("buzzerCtrl(1, 0)")
@@ -550,19 +487,26 @@ Keep your response under 50 words."""
             
             # Speak the warning message
             print(f"Speaking: {warning_message}")
-            await self.send_speak_command(warning_message)
+            await self.send_command(f"speak:{warning_message}")
             
             # Enhanced movement sequence - make the robot look more alert
             # Turn head to look for intruder
-            await self.perform_movement("lookLeft", 0.5)
-            await self.perform_movement("lookRight", 0.5)
+            await self.send_command("lookLeft")
+            await asyncio.sleep(0.5)
+            await self.send_command("LRstop")
+            await asyncio.sleep(0.5)
+            await self.send_command("lookRight")
+            await asyncio.sleep(0.5)
+            await self.send_command("LRstop")
             
             # Turn body to face intruder
             direction = random.choice(["left", "right"])
-            await self.perform_movement(direction, 0.8)
+            await self.send_command(direction)
+            await asyncio.sleep(0.8)
+            await self.send_command("TS")
             
             # Bark again after turning
-            await self.bark()
+            await self.bark_sequence("excited")
             
             # Flash alert lights
             for _ in range(4):
@@ -642,23 +586,34 @@ Keep your response under 50 words."""
                     print("Performing patrol movement")
                     self.last_patrol_time = current_time
                     
-                    # Make a sound to indicate patrol
-                    await self.send_speak_command("Patrolling the area")
+                    # Announce patrol
+                    await self.send_command("speak:Patrolling the area")
                     
                     # Choose movement pattern
                     if self.patrol_random:
                         # Random patrol pattern
                         # Pick 2-3 movements
                         num_movements = random.randint(2, 3)
-                        movements = random.sample(patrol_movements, num_movements)
-                        
-                        # Perform each movement
-                        for move in movements:
+                        for _ in range(num_movements):
                             # Check if patrol is still active before each movement
                             if not (self.patrol_mode and self.watchdog_enabled and not self.is_alerting):
                                 break
                                 
-                            await self.perform_movement(move["movement"], move["duration"])
+                            # Choose random movement
+                            move = random.choice(patrol_movements)
+                            
+                            # Execute movement
+                            await self.send_command(move["movement"])
+                            await asyncio.sleep(move["duration"])
+                            
+                            # Stop movement
+                            if move["movement"] in ["forward", "backward"]:
+                                await self.send_command("DS")
+                            elif move["movement"] in ["left", "right"]:
+                                await self.send_command("TS")
+                            elif move["movement"] in ["lookLeft", "lookRight"]:
+                                await self.send_command("LRstop")
+                                
                             await asyncio.sleep(0.5)  # Pause between movements
                     else:
                         # Sequential patrol pattern
@@ -670,11 +625,27 @@ Keep your response under 50 words."""
                         self.patrol_index += 1
                         
                         # Perform the movement
-                        await self.perform_movement(movement, 1.0)
+                        await self.send_command(movement)
+                        await asyncio.sleep(1.0)
+                        
+                        # Stop movement
+                        if movement in ["forward", "backward"]:
+                            await self.send_command("DS")
+                        elif movement in ["left", "right"]:
+                            await self.send_command("TS")
                     
                     # Look around after patrol movement
-                    await self.perform_movement("lookLeft", 0.5)
-                    await self.perform_movement("lookRight", 0.5)
+                    await self.send_command("lookLeft")
+                    await asyncio.sleep(0.5)
+                    await self.send_command("LRstop")
+                    await asyncio.sleep(0.3)
+                    await self.send_command("lookRight")
+                    await asyncio.sleep(0.5)
+                    await self.send_command("LRstop")
+                    
+                    # Occasionally bark during patrol
+                    if random.random() < 0.3:  # 30% chance to bark
+                        await self.bark_sequence("short")
                 
                 # Sleep for a bit to avoid busy waiting
                 await asyncio.sleep(5)
@@ -781,7 +752,7 @@ Keep your response under 50 words."""
                             self.toggle_patrol_mode(not self.patrol_mode)
                         elif key == ord('b'):
                             # Manual bark for testing
-                            asyncio.run(self.bark())
+                            asyncio.run(self.bark_sequence("excited"))
                 
                 # Sleep briefly to avoid excessive CPU usage
                 time.sleep(0.03)
@@ -804,6 +775,9 @@ Keep your response under 50 words."""
             video_thread = threading.Thread(target=self.capture_video)
             video_thread.daemon = True
             video_thread.start()
+            
+            # Start with a greeting message
+            asyncio.run(self.send_command("speak:Security watchdog initialized and ready!"))
             
             # Start frame processing
             print("\nStarting watchdog monitor...")
