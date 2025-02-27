@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Enhanced Robot Watchdog with correct command syntax
-# Uses proper speak and bark command formats
+# Enhanced Robot Watchdog with YOLO person detection and Claude-generated warning messages
+# Simplified version without light/buzzer controls
 
 import cv2
 import time
@@ -18,6 +18,7 @@ import base64
 import sys
 import anthropic  # pip install anthropic
 from dotenv import load_dotenv
+from ultralytics import YOLO  # pip install ultralytics
 
 class RobotWatchdogAI:
     def __init__(self, robot_ip, claude_api_key=None):
@@ -27,19 +28,41 @@ class RobotWatchdogAI:
         self.video_url = f"http://{robot_ip}:5000/video_feed"
         self.websocket = None
         
+        # YOLO model for person detection
+        self.model = None
+        try:
+            self.model = YOLO("yolov8n.pt")  # Load the smallest model for speed
+            print("YOLO model loaded successfully!")
+        except Exception as e:
+            print(f"Error loading YOLO model: {e}")
+            print("Falling back to motion detection")
+            
+        # Person detection settings
+        self.person_detected = False
+        self.person_count = 0
+        self.person_boxes = []
+        self.consecutive_person_detections = 0
+        self.person_detection_threshold = 3  # How many consecutive detections to trigger
+        self.person_detection_cooldown = 30  # Seconds between person alerts
+        self.last_person_time = 0
+        self.use_yolo = self.model is not None
+        
         # Watchdog settings
         self.running = True
         self.watchdog_enabled = False
         self.alerts_enabled = True
         self.is_alerting = False
-        self.consecutive_detections = 0
-        self.detection_threshold_count = 3  # How many detections to trigger alert
-        self.detection_threshold = 2000  # Minimum contour area for motion detection
         self.detection_cooldown = 30  # Seconds between alerts
         self.last_alert_time = 0
-        self.last_motion_time = 0
+        
+        # Motion detection fallback
+        self.avg = None
         self.motion_detected = False
         self.motion_area = None
+        self.consecutive_detections = 0
+        self.detection_threshold_count = 3
+        self.detection_threshold = 2000
+        self.last_motion_time = 0
         
         # New patrol mode settings
         self.patrol_mode = False
@@ -57,20 +80,15 @@ class RobotWatchdogAI:
         self.ai_enabled = claude_api_key is not None
         self.last_vision_analysis_time = 0
         self.vision_analysis_interval = 15  # Seconds between vision analysis
-        self.detected_objects = []
-        self.detected_people = []
-        self.detected_vehicles = []
         self.intruder_description = ""
-        
-        # Background model for motion detection
-        self.avg = None
+        self.generated_warning = ""
         
         # Frame processing
         self.frame_queue = Queue(maxsize=10)
         self.recent_frames = []  # Store recent frames for recording
         self.max_recent_frames = 50  # Max number of frames to keep
         
-        # Warning messages
+        # Fallback generic warnings (used when Claude is not available)
         self.generic_warnings = [
             "Intruder detected! The police has been notified.",
             "Warning! This area is under surveillance.",
@@ -94,6 +112,7 @@ class RobotWatchdogAI:
         print(f"Video stream: {self.video_url}")
         print(f"WebSocket URL: {self.ws_url}")
         print(f"AI Vision: {'Enabled' if self.ai_enabled else 'Disabled'}")
+        print(f"Person Detection: {'YOLO' if self.use_yolo else 'Motion-based (fallback)'}")
         
     async def connect_websocket(self):
         """Connect to robot's WebSocket server"""
@@ -211,9 +230,78 @@ class RobotWatchdogAI:
                     
         print("Video capture stopped")
     
+    def detect_persons_yolo(self, frame):
+        """Detect persons in the frame using YOLO"""
+        if not self.watchdog_enabled or not self.use_yolo:
+            return False
+            
+        try:
+            # Run YOLO detection
+            results = self.model(frame, classes=[0])  # Class 0 is person in COCO dataset
+            
+            # Process results
+            self.person_boxes = []
+            self.person_count = 0
+            
+            # Check for people in results
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    # Extract box coordinates and convert to integers
+                    box_coords = box.xyxy[0].tolist()
+                    x1, y1, x2, y2 = [int(coord) for coord in box_coords]
+                    conf = float(box.conf[0])
+                    
+                    # Only count high-confidence detections
+                    if conf > 0.5:  # Confidence threshold
+                        self.person_count += 1
+                        self.person_boxes.append((x1, y1, x2, y2, conf))
+            
+            # Update person detection status
+            previous_person_detected = self.person_detected
+            self.person_detected = self.person_count > 0
+            
+            if self.person_detected:
+                self.last_person_time = time.time()
+                
+                # Update consecutive detections
+                self.consecutive_person_detections += 1
+                
+                # Check if we should trigger alert
+                if (self.consecutive_person_detections >= self.person_detection_threshold and 
+                        self.alerts_enabled and not self.is_alerting):
+                    
+                    # If Claude is enabled, send frame for analysis
+                    if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
+                        # Run vision analysis in separate thread to avoid blocking
+                        analysis_thread = threading.Thread(
+                            target=lambda: asyncio.run(self.analyze_frame_with_claude(frame.copy()))
+                        )
+                        analysis_thread.daemon = True
+                        analysis_thread.start()
+                    else:
+                        # Trigger alert without vision analysis
+                        asyncio.run(self.trigger_alert())
+                
+                # Save image on first detection
+                if not previous_person_detected:
+                    self.save_detection_image(frame)
+            else:
+                # Reset consecutive detections after 3 seconds of no person
+                if time.time() - self.last_person_time > 3:
+                    self.consecutive_person_detections = 0
+            
+            return self.person_detected
+            
+        except Exception as e:
+            print(f"YOLO detection error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
     def detect_motion(self, frame):
         """Detect motion in the frame using background subtraction"""
-        if not self.watchdog_enabled:
+        if not self.watchdog_enabled or self.use_yolo:
             return False
             
         try:
@@ -281,12 +369,6 @@ class RobotWatchdogAI:
                         # Trigger alert without vision analysis
                         asyncio.run(self.trigger_alert())
                     
-                # Draw motion area on frame
-                x, y, w, h = self.motion_area
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(frame, "Motion Detected", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
                 # Save frame if motion was just detected
                 if not prev_motion:
                     self.save_detection_image(frame)
@@ -316,25 +398,27 @@ class RobotWatchdogAI:
             _, buffer = cv2.imencode('.jpg', frame)
             image_base64 = base64.b64encode(buffer).decode('utf-8')
             
-            # Create message with Claude client
+            # Step 1: First get intruder description
             try:
-                message = self.claude_client.messages.create(
+                description_message = self.claude_client.messages.create(
                     model=self.claude_model,
                     max_tokens=1024,
-                    system="You are a security system that identifies potential intruders or unusual activity. Describe what you see accurately and concisely. Focus on people, vehicles, or suspicious activities.",
+                    system="You are a security system that identifies potential intruders. Focus on providing a detailed description of any people you see, especially their clothing, physical appearance, what they're doing, and where they are in the image. This will be used to directly address the intruder.",
                     messages=[
                         {
                             "role": "user",
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": """Analyze this security camera image and tell me if you see any people, vehicles, or suspicious activity. 
+                                    "text": """Analyze this security camera image of an intruder.
                                     
-If you see a person, describe them briefly (clothing, appearance).
-If you see a vehicle, describe its type and color.
-If you don't see any people or vehicles, just say "No people or vehicles detected."
+Please describe the person in detail, focusing on:
+1. Their clothing (colors, style)
+2. Physical appearance (height, build, hair, etc.)
+3. What they appear to be doing
+4. Where they are in the frame (near the door, in the hallway, etc.)
 
-Keep your response under 50 words."""
+Keep your response under 50 words and focus only on describing the person."""
                                 },
                                 {
                                     "type": "image",
@@ -349,23 +433,76 @@ Keep your response under 50 words."""
                     ]
                 )
                 
-                analysis = message.content[0].text
-                print(f"Claude analysis: {analysis}")
+                intruder_description = description_message.content[0].text
+                print(f"Claude description: {intruder_description}")
                 
                 # Update intruder description
-                self.intruder_description = analysis
+                self.intruder_description = intruder_description
                 
-                # Trigger alert with the analysis
-                await self.trigger_alert(analysis)
+                # Step 2: Generate warning message based on intruder description
+                if "no people" not in intruder_description.lower() and len(intruder_description) > 10:
+                    warning_message = await self.generate_warning_message(intruder_description)
+                    
+                    # Trigger alert with the warning message
+                    await self.trigger_alert(warning_message)
+                else:
+                    # No person clearly detected, use generic alert
+                    await self.trigger_alert()
                 
             except Exception as e:
-                print(f"Error with Claude API: {e}")
+                print(f"Error with Claude description API: {e}")
                 # Fall back to regular alert
                 await self.trigger_alert()
             
         except Exception as e:
             print(f"Vision analysis error: {e}")
             await self.trigger_alert()  # Fall back to regular alert
+    
+    async def generate_warning_message(self, intruder_description):
+        """Generate personalized warning message based on intruder description"""
+        try:
+            # Use Claude to generate a personalized warning message
+            warning_message = self.claude_client.messages.create(
+                model=self.claude_model,
+                max_tokens=1024,
+                system="You are a security robot confronting an intruder. You should generate a direct, authoritative warning message addressing the intruder based on their appearance. Be intimidating but not threatening. Your message should sound like it's being spoken by a security system.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"""Based on this description of an intruder, generate a warning message directly addressing them:
+
+{intruder_description}
+
+Generate a security robot warning message that:
+1. Directly references the person's appearance (clothing, location, etc.)
+2. Sounds authoritative and firm
+3. Warns them they are being monitored/recorded
+4. Tells them to leave immediately or identify themselves
+5. Mentions that authorities have been notified
+
+Keep the message under 100 characters and make it sound like a direct verbal warning from a security robot.
+Do NOT use any placeholder expressions like [clothing]. Replace such placeholders with actual details from the description."""
+                            }
+                        ]
+                    }
+                ]
+            )
+            
+            generated_warning = warning_message.content[0].text
+            print(f"Generated warning: {generated_warning}")
+            
+            # Store the generated warning
+            self.generated_warning = generated_warning
+            
+            return generated_warning
+            
+        except Exception as e:
+            print(f"Warning generation error: {e}")
+            # Fall back to generic warning
+            return random.choice(self.generic_warnings)
     
     def save_detection_image(self, frame):
         """Save a detection image to disk"""
@@ -374,13 +511,25 @@ Keep your response under 50 words."""
             filename = f"intruder_{timestamp}.jpg"
             filepath = os.path.join(self.save_dir, filename)
             
+            # Create a copy for saving
+            save_frame = frame.copy()
+            
             # Add timestamp to the image
             timestamp_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(frame, timestamp_text, (10, frame.shape[0] - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+            cv2.putText(save_frame, timestamp_text, (10, save_frame.shape[0] - 10), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+            
+            # Draw bounding boxes for persons if using YOLO
+            if self.use_yolo and self.person_boxes:
+                for box in self.person_boxes:
+                    x1, y1, x2, y2, conf = box
+                    cv2.rectangle(save_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"Person: {conf:.2f}"
+                    cv2.putText(save_frame, label, (x1, y1 - 10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
             # Save image
-            cv2.imwrite(filepath, frame)
+            cv2.imwrite(filepath, save_frame)
             print(f"Saved detection image to {filepath}")
             
             # Save a short video clip if we have enough frames
@@ -414,8 +563,8 @@ Keep your response under 50 words."""
         except Exception as e:
             print(f"Error saving detection video: {e}")
     
-    async def trigger_alert(self, vision_analysis=None):
-        """Trigger alert when motion is detected"""
+    async def trigger_alert(self, warning_message=None):
+        """Trigger alert when person is detected"""
         current_time = time.time()
         
         # Only alert if cooldown period has passed
@@ -433,59 +582,25 @@ Keep your response under 50 words."""
         
         # Start alert sequence in a separate thread
         alert_thread = threading.Thread(
-            target=lambda: asyncio.run(self.alert_sequence(vision_analysis, was_patrolling))
+            target=lambda: asyncio.run(self.alert_sequence(warning_message, was_patrolling))
         )
         alert_thread.daemon = True
         alert_thread.start()
     
-    async def alert_sequence(self, vision_analysis=None, resume_patrol=False):
+    async def alert_sequence(self, warning_message=None, resume_patrol=False):
         """Run the alert sequence"""
         try:
             print("⚠️ ALERT! Intruder detected!")
             
-            # Set red alert light
-            await self.send_command("lightCtrl('red', 0)")
-            
             # First, make the robot bark
             await self.bark_sequence("alert")
             
-            # Sound the alarm
-            await self.send_command("buzzerCtrl(1, 0)")
-            await asyncio.sleep(1.5)
-            await self.send_command("buzzerCtrl(0, 0)")
-            await asyncio.sleep(0.5)
-            await self.send_command("buzzerCtrl(1, 0)")
-            await asyncio.sleep(1.5)
-            await self.send_command("buzzerCtrl(0, 0)")
-            
-            # Prepare warning message
-            warning_message = ""
-            
-            # If we have vision analysis, use it for a more specific warning
-            if vision_analysis and "no people" not in vision_analysis.lower():
-                # Include description in the warning
-                warning_prefix = random.choice([
-                    "Security alert! Detecting ",
-                    "Warning! I can see ",
-                    "Intruder alert! Identified "
-                ])
-                
-                warning_suffix = random.choice([
-                    ". The police have been notified.",
-                    ". Security system activated.",
-                    ". This area is under surveillance."
-                ])
-                
-                warning_message = warning_prefix + vision_analysis.strip() + warning_suffix
-            else:
+            # Use provided warning message or generic fallback
+            if not warning_message:
                 # Use generic warning message
-                message_index = random.randrange(len(self.generic_warnings))
-                while message_index == self.last_message_index and len(self.generic_warnings) > 1:
-                    message_index = random.randrange(len(self.generic_warnings))
-                self.last_message_index = message_index
-                warning_message = self.generic_warnings[message_index]
+                warning_message = random.choice(self.generic_warnings)
             
-            # Speak the warning message
+            # Speak the warning message directly addressing the intruder
             print(f"Speaking: {warning_message}")
             await self.send_command(f"speak:{warning_message}")
             
@@ -505,18 +620,22 @@ Keep your response under 50 words."""
             await asyncio.sleep(0.8)
             await self.send_command("TS")
             
+            # Additional personalized message
+            second_message = random.choice([
+                "I've already called security.",
+                "This area is off-limits. Leave now.",
+                "Your face has been recorded.",
+                "Don't move! Authorities are on their way.",
+                "Security system activated. Please leave immediately."
+            ])
+            await self.send_command(f"speak:{second_message}")
+            
             # Bark again after turning
             await self.bark_sequence("excited")
             
-            # Flash alert lights
-            for _ in range(4):
-                await self.send_command("lightCtrl('red', 0)")
-                await asyncio.sleep(0.7)
-                await self.send_command("lightCtrl('blue', 0)")
-                await asyncio.sleep(0.7)
+            # Pause before finishing alert
+            await asyncio.sleep(3.0)
             
-            # Return to standby state
-            await self.send_command("lightCtrl('blue', 0)")
             self.is_alerting = False
             
             # Resume patrol if it was active before
@@ -531,6 +650,7 @@ Keep your response under 50 words."""
         """Enable watchdog mode"""
         self.watchdog_enabled = True
         self.consecutive_detections = 0
+        self.consecutive_person_detections = 0
         self.avg = None  # Reset background model
         print("Watchdog mode enabled")
         
@@ -678,9 +798,28 @@ Keep your response under 50 words."""
                     # Clone the frame for display
                     display_frame = frame.copy()
                     
-                    # Detect motion if watchdog is enabled
+                    # Detect intruders if watchdog is enabled
                     if self.watchdog_enabled:
-                        motion = self.detect_motion(display_frame)
+                        if self.use_yolo:
+                            # Use YOLO for person detection
+                            person_detected = self.detect_persons_yolo(display_frame)
+                            
+                            # Draw bounding boxes for detected persons
+                            if person_detected and self.person_boxes:
+                                for box in self.person_boxes:
+                                    x1, y1, x2, y2, conf = box
+                                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                    label = f"Person: {conf:.2f}"
+                                    cv2.putText(display_frame, label, (x1, y1 - 10), 
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        else:
+                            # Use motion detection as fallback
+                            motion_detected = self.detect_motion(display_frame)
+                            
+                            # Draw motion area if detected
+                            if motion_detected and self.motion_area:
+                                x, y, w, h = self.motion_area
+                                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                         
                         # Add status text
                         status_text = f"Watchdog: {'ENABLED' if self.watchdog_enabled else 'DISABLED'}"
@@ -695,17 +834,25 @@ Keep your response under 50 words."""
                         cv2.putText(display_frame, ai_text, (10, 90), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         
-                        patrol_text = f"Patrol Mode: {'ON' if self.patrol_mode else 'OFF'}"
-                        cv2.putText(display_frame, patrol_text, (10, 120), 
+                        detection_text = f"Detection: {'YOLO' if self.use_yolo else 'Motion'}"
+                        cv2.putText(display_frame, detection_text, (10, 120), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         
-                        if motion:
-                            motion_text = f"Motion Detected! Count: {self.consecutive_detections}"
-                            cv2.putText(display_frame, motion_text, (10, 150), 
+                        patrol_text = f"Patrol Mode: {'ON' if self.patrol_mode else 'OFF'}"
+                        cv2.putText(display_frame, patrol_text, (10, 150), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        if self.use_yolo and self.person_detected:
+                            person_text = f"Person Detected! Count: {self.person_count}, Consecutive: {self.consecutive_person_detections}"
+                            cv2.putText(display_frame, person_text, (10, 180), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        elif not self.use_yolo and self.motion_detected:
+                            motion_text = f"Motion Detected! Consecutive: {self.consecutive_detections}"
+                            cv2.putText(display_frame, motion_text, (10, 180), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                                         
                         # Show intruder description if available
-                        if self.intruder_description and self.intruder_description != "No people or vehicles detected.":
+                        if self.intruder_description and "no people" not in self.intruder_description.lower():
                             # Split into multiple lines if too long
                             words = self.intruder_description.split()
                             lines = []
@@ -720,10 +867,40 @@ Keep your response under 50 words."""
                             if current_line:
                                 lines.append(' '.join(current_line))
                                 
-                            # Display lines
+                            # Display description lines
+                            cv2.putText(display_frame, "Description:", (10, 210), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                             for i, line in enumerate(lines):
-                                cv2.putText(display_frame, line, (10, 180 + i*30), 
+                                cv2.putText(display_frame, line, (10, 240 + i*30), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                        
+                        # Show generated warning if available
+                        if self.generated_warning:
+                            # Split into multiple lines if too long
+                            words = self.generated_warning.split()
+                            lines = []
+                            current_line = []
+                            
+                            for word in words:
+                                current_line.append(word)
+                                if len(' '.join(current_line)) > 60:  # Line length limit
+                                    lines.append(' '.join(current_line[:-1]))
+                                    current_line = [word]
+                            
+                            if current_line:
+                                lines.append(' '.join(current_line))
+                                
+                            # Display warning lines
+                            y_offset = 240
+                            if self.intruder_description:
+                                # Adjust offset if description is shown
+                                y_offset = 240 + 30 * (len(self.intruder_description.split('\n')) + 1)
+                                
+                            cv2.putText(display_frame, "Warning Message:", (10, y_offset), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                            for i, line in enumerate(lines):
+                                cv2.putText(display_frame, line, (10, y_offset + 30 + i*30), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                     else:
                         status_text = "Watchdog: DISABLED"
                         cv2.putText(display_frame, status_text, (10, 30), 
@@ -796,9 +973,6 @@ Keep your response under 50 words."""
         finally:
             self.running = False
             
-            # Set the light back to blue when exiting
-            asyncio.run(self.send_command("lightCtrl('blue', 0)"))
-            
             # Close WebSocket connection
             if self.websocket:
                 asyncio.run(self.websocket.close())
@@ -808,7 +982,7 @@ Keep your response under 50 words."""
 def main():
     load_dotenv()  
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Robot Watchdog Monitor with AI Vision")
+    parser = argparse.ArgumentParser(description="Robot Watchdog with Prompt-Generated Warning Messages")
     parser.add_argument("--ip", type=str, default=None,
                         help="Robot IP address (default: from ROBOT_IP_ADDRESS env var)")
     parser.add_argument("--enable", action="store_true", 
@@ -817,6 +991,8 @@ def main():
                         help="Enable patrol mode on startup")
     parser.add_argument("--claude-key", type=str, default=None,
                         help="Claude API key for vision analysis (default: from CLAUDE_API_KEY env var)")
+    parser.add_argument("--no-yolo", action="store_true",
+                        help="Disable YOLO and use motion detection instead")
     parser.add_argument("--nodisplay", action="store_true",
                         help="Run without display window (headless mode)")
     
@@ -836,6 +1012,10 @@ def main():
     
     # Create and run watchdog
     watchdog = RobotWatchdogAI(robot_ip, claude_api_key)
+    
+    # Disable YOLO if requested
+    if args.no_yolo:
+        watchdog.use_yolo = False
     
     # Enable watchdog if requested
     if args.enable:
