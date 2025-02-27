@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Enhanced Robot Watchdog with YOLO person detection and Claude-generated warning messages
-# Simplified version without light/buzzer controls
+# Enhanced Robot Watchdog with YOLO person detection, Claude-generated warnings, and intruder tracking
 
 import cv2
 import time
@@ -15,7 +14,6 @@ import argparse
 import numpy as np
 from queue import Queue
 import base64
-import sys
 import anthropic  # pip install anthropic
 from dotenv import load_dotenv
 from ultralytics import YOLO  # pip install ultralytics
@@ -47,6 +45,21 @@ class RobotWatchdogAI:
         self.last_person_time = 0
         self.use_yolo = self.model is not None
         
+        # NEW: Intruder tracking settings
+        self.tracking_enabled = True
+        self.track_duration = 60  # How long to track an intruder (seconds)
+        self.tracking_started = 0
+        self.is_tracking = False
+        self.target_person_box = None
+        self.frame_width = 640  # Default frame width
+        self.frame_height = 480  # Default frame height
+        self.tracking_distance_threshold = 100  # Pixel distance to consider person "close"
+        self.person_lost_threshold = 10  # Frames without detection before considering person lost
+        self.frames_without_person = 0
+        self.last_movement_command = None
+        self.last_movement_time = 0
+        self.movement_cooldown = 1.0  # Seconds between movement commands
+        
         # Watchdog settings
         self.running = True
         self.watchdog_enabled = False
@@ -64,7 +77,7 @@ class RobotWatchdogAI:
         self.detection_threshold = 2000
         self.last_motion_time = 0
         
-        # New patrol mode settings
+        # Patrol mode settings
         self.patrol_mode = False
         self.patrol_thread = None
         self.patrol_interval = 60  # Time between patrol movements in seconds
@@ -76,12 +89,19 @@ class RobotWatchdogAI:
         # AI vision settings
         self.claude_api_key = claude_api_key
         self.claude_client = None
-        self.claude_model = "claude-3-7-sonnet-20250219"  # Can fall back to other models
+        self.claude_model = "claude-3-7-sonnet-20250219"
         self.ai_enabled = claude_api_key is not None
         self.last_vision_analysis_time = 0
         self.vision_analysis_interval = 15  # Seconds between vision analysis
         self.intruder_description = ""
         self.generated_warning = ""
+        
+        # NEW: Intruder behavior analysis
+        self.intruder_behavior = "unknown"  # unknown, approaching, retreating, stationary
+        self.previous_positions = []  # Store previous positions to analyze movement
+        self.max_positions = 10
+        self.behavior_confidence = 0
+        self.intruder_distance = "unknown"  # far, medium, close
         
         # Frame processing
         self.frame_queue = Queue(maxsize=10)
@@ -113,6 +133,7 @@ class RobotWatchdogAI:
         print(f"WebSocket URL: {self.ws_url}")
         print(f"AI Vision: {'Enabled' if self.ai_enabled else 'Disabled'}")
         print(f"Person Detection: {'YOLO' if self.use_yolo else 'Motion-based (fallback)'}")
+        print(f"Intruder Tracking: {'Enabled' if self.tracking_enabled else 'Disabled'}")
         
     async def connect_websocket(self):
         """Connect to robot's WebSocket server"""
@@ -168,9 +189,9 @@ class RobotWatchdogAI:
         
         pattern = patterns.get(intensity, patterns["normal"])
         for duration, pause in pattern:
-            await self.send_command_multiple("bark", times=2)
+            await self.send_command("bark")  # Using 'buzzer on' as bark
             await asyncio.sleep(duration)
-            await self.send_command_multiple("bark", times=2)
+            await self.send_command("bark")
             await asyncio.sleep(pause)
         
     def capture_video(self):
@@ -199,6 +220,10 @@ class RobotWatchdogAI:
                     if not ret:
                         print("Failed to read frame, reconnecting...")
                         break
+                    
+                    # Update frame dimensions
+                    self.frame_width = frame.shape[1]
+                    self.frame_height = frame.shape[0]
                     
                     # Store frame in queue
                     if not self.frame_queue.full():
@@ -263,9 +288,18 @@ class RobotWatchdogAI:
             
             if self.person_detected:
                 self.last_person_time = time.time()
+                self.frames_without_person = 0
                 
                 # Update consecutive detections
                 self.consecutive_person_detections += 1
+                
+                # If tracking is enabled, select the best person to track
+                if self.tracking_enabled and self.consecutive_person_detections >= self.person_detection_threshold:
+                    self.select_target_person()
+                    
+                # Analyze intruder behavior if we have a target
+                if self.target_person_box:
+                    self.analyze_intruder_behavior()
                 
                 # Check if we should trigger alert
                 if (self.consecutive_person_detections >= self.person_detection_threshold and 
@@ -287,9 +321,20 @@ class RobotWatchdogAI:
                 if not previous_person_detected:
                     self.save_detection_image(frame)
             else:
+                # Increment frames without person
+                self.frames_without_person += 1
+                
                 # Reset consecutive detections after 3 seconds of no person
                 if time.time() - self.last_person_time > 3:
                     self.consecutive_person_detections = 0
+                
+                # If tracking and person lost for too long, stop tracking
+                if self.is_tracking and self.frames_without_person > self.person_lost_threshold:
+                    print("Person lost while tracking, stopping tracking.")
+                    self.is_tracking = False
+                    self.target_person_box = None
+                    asyncio.run(self.send_command("DS"))  # Stop forward/backward
+                    asyncio.run(self.send_command("TS"))  # Stop left/right
             
             return self.person_detected
             
@@ -298,92 +343,223 @@ class RobotWatchdogAI:
             import traceback
             traceback.print_exc()
             return False
-            
-    def detect_motion(self, frame):
-        """Detect motion in the frame using background subtraction"""
-        if not self.watchdog_enabled or self.use_yolo:
-            return False
-            
-        try:
-            # Convert to grayscale and blur
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
-            
-            # Initialize background model if needed
-            if self.avg is None:
-                print("Initializing background model...")
-                self.avg = gray.copy().astype("float")
-                return False
-                
-            # Update background model
-            cv2.accumulateWeighted(gray, self.avg, 0.5)
-            
-            # Compute difference between current frame and background
-            frameDelta = cv2.absdiff(gray, cv2.convertScaleAbs(self.avg))
-            
-            # Threshold the delta image and dilate to fill holes
-            thresh = cv2.threshold(frameDelta, 25, 255, cv2.THRESH_BINARY)[1]
-            thresh = cv2.dilate(thresh, None, iterations=2)
-            
-            # Find contours
-            contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Check for significant motion
-            motion_detected = False
+
+    def select_target_person(self):
+        """Select the best person to track based on size and position"""
+        if not self.person_boxes:
+            return
+        
+        # If we're not tracking yet, start tracking the largest person
+        if not self.is_tracking:
+            # Find the largest person (by area)
             largest_area = 0
-            largest_contour = None
+            largest_box = None
             
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > self.detection_threshold:
-                    if area > largest_area:
-                        largest_area = area
-                        largest_contour = contour
-                    motion_detected = True
-            
-            # Update motion status
-            prev_motion = self.motion_detected
-            self.motion_detected = motion_detected
-            
-            if motion_detected and largest_contour is not None:
-                # Get bounding box of motion area
-                self.motion_area = cv2.boundingRect(largest_contour)
-                self.last_motion_time = time.time()
+            for box in self.person_boxes:
+                x1, y1, x2, y2, conf = box
+                area = (x2 - x1) * (y2 - y1)
                 
-                # Update consecutive detections
-                self.consecutive_detections += 1
+                if area > largest_area:
+                    largest_area = area
+                    largest_box = box
+            
+            if largest_box:
+                self.target_person_box = largest_box
+                self.is_tracking = True
+                self.tracking_started = time.time()
+                print(f"Started tracking person at {self.target_person_box}")
+        else:
+            # We're already tracking, find the closest person to our current target
+            if self.target_person_box:
+                # Get center of current target
+                x1, y1, x2, y2, _ = self.target_person_box
+                target_cx = (x1 + x2) // 2
+                target_cy = (y1 + y2) // 2
                 
-                # Check if we should trigger alert
-                if (self.consecutive_detections >= self.detection_threshold_count and 
-                        self.alerts_enabled and not self.is_alerting):
+                # Find closest person
+                closest_dist = float('inf')
+                closest_box = None
+                
+                for box in self.person_boxes:
+                    x1, y1, x2, y2, conf = box
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
                     
-                    # If AI is enabled, analyze the image first
-                    if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
-                        # Run vision analysis in separate thread to avoid blocking
-                        analysis_thread = threading.Thread(
-                            target=lambda: asyncio.run(self.analyze_frame_with_claude(frame.copy()))
-                        )
-                        analysis_thread.daemon = True
-                        analysis_thread.start()
-                    else:
-                        # Trigger alert without vision analysis
-                        asyncio.run(self.trigger_alert())
+                    # Calculate Euclidean distance
+                    dist = np.sqrt((cx - target_cx)**2 + (cy - target_cy)**2)
                     
-                # Save frame if motion was just detected
-                if not prev_motion:
-                    self.save_detection_image(frame)
+                    if dist < closest_dist:
+                        closest_dist = dist
+                        closest_box = box
+                
+                if closest_box:
+                    self.target_person_box = closest_box
+            
+            # Check if we should stop tracking based on duration
+            if time.time() - self.tracking_started > self.track_duration:
+                print(f"Tracking duration exceeded, stopping tracking.")
+                self.is_tracking = False
+                self.target_person_box = None
+    
+    def analyze_intruder_behavior(self):
+        """Analyze intruder behavior based on position and movement"""
+        if not self.target_person_box:
+            return
+        
+        # Get current position
+        x1, y1, x2, y2, _ = self.target_person_box
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Calculate relative position in frame
+        rel_x = cx / self.frame_width  # 0.0 to 1.0 (left to right)
+        rel_y = cy / self.frame_height  # 0.0 to 1.0 (top to bottom)
+        rel_size = (width * height) / (self.frame_width * self.frame_height)  # Relative size
+        
+        # Add to position history
+        self.previous_positions.append((cx, cy, rel_size, time.time()))
+        if len(self.previous_positions) > self.max_positions:
+            self.previous_positions.pop(0)
+        
+        # Determine distance category based on relative size
+        if rel_size > 0.15:
+            self.intruder_distance = "close"
+        elif rel_size > 0.05:
+            self.intruder_distance = "medium"
+        else:
+            self.intruder_distance = "far"
+        
+        # Need at least 3 positions to analyze movement
+        if len(self.previous_positions) < 3:
+            return
+        
+        # Analyze movement direction and speed
+        movement_x = 0
+        movement_y = 0
+        size_change = 0
+        count = 0
+        
+        for i in range(1, len(self.previous_positions)):
+            prev_x, prev_y, prev_size, prev_time = self.previous_positions[i-1]
+            curr_x, curr_y, curr_size, curr_time = self.previous_positions[i]
+            
+            if curr_time - prev_time > 1.0:  # Skip if time gap is too large
+                continue
+                
+            movement_x += curr_x - prev_x
+            movement_y += curr_y - prev_y
+            size_change += curr_size - prev_size
+            count += 1
+        
+        if count > 0:
+            avg_movement_x = movement_x / count
+            avg_movement_y = movement_y / count
+            avg_size_change = size_change / count
+            
+            # Determine behavior based on movement
+            if abs(avg_movement_x) < 5 and abs(avg_movement_y) < 5 and abs(avg_size_change) < 0.01:
+                self.intruder_behavior = "stationary"
+            elif avg_size_change > 0.01:
+                self.intruder_behavior = "approaching"
+                self.behavior_confidence = min(self.behavior_confidence + 1, 10)
+            elif avg_size_change < -0.01:
+                self.intruder_behavior = "retreating"
+                self.behavior_confidence = min(self.behavior_confidence + 1, 10)
+            elif abs(avg_movement_x) > 10:
+                if avg_movement_x > 0:
+                    self.intruder_behavior = "moving_right"
+                else:
+                    self.intruder_behavior = "moving_left"
+                self.behavior_confidence = min(self.behavior_confidence + 1, 10)
             else:
-                # Reset consecutive detections after 3 seconds of no motion
-                if time.time() - self.last_motion_time > 3:
-                    self.consecutive_detections = 0
-            
-            return motion_detected
-            
-        except Exception as e:
-            print(f"Motion detection error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+                # If not confident, maintain previous behavior
+                self.behavior_confidence = max(self.behavior_confidence - 1, 0)
+                if self.behavior_confidence < 3:
+                    self.intruder_behavior = "unknown"
+    
+    async def track_and_follow_person(self):
+        """Track and follow the detected person"""
+        if not self.is_tracking or not self.target_person_box:
+            return
+        
+        current_time = time.time()
+        if current_time - self.last_movement_time < self.movement_cooldown:
+            return  # Don't move too frequently
+        
+        # Get target position
+        x1, y1, x2, y2, _ = self.target_person_box
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        
+        frame_center_x = self.frame_width // 2
+        frame_center_y = self.frame_height // 2
+        
+        # Calculate offsets from center
+        offset_x = center_x - frame_center_x
+        offset_y = center_y - frame_center_y
+        
+        # Determine movement commands
+        move_horizontal = None
+        move_vertical = None
+        
+        # Horizontal tracking (turn left/right)
+        if offset_x < -50:  # Person is to the left
+            move_horizontal = "left"
+        elif offset_x > 50:  # Person is to the right
+            move_horizontal = "right"
+        
+        # Vertical tracking (look up/down)
+        if offset_y < -30:  # Person is above center
+            move_vertical = "lookUp"
+        elif offset_y > 30:  # Person is below center
+            move_vertical = "lookDown"
+        
+        # Execute movement commands
+        commands_sent = False
+        
+        if move_horizontal and move_horizontal != self.last_movement_command:
+            await self.send_command(move_horizontal)
+            self.last_movement_command = move_horizontal
+            commands_sent = True
+        elif not move_horizontal and self.last_movement_command in ["left", "right"]:
+            await self.send_command("TS")  # Stop turning
+            self.last_movement_command = None
+            commands_sent = True
+        
+        if move_vertical:
+            await self.send_command(move_vertical)
+            commands_sent = True
+        elif self.last_movement_command in ["lookUp", "lookDown"]:
+            await self.send_command("UDstop")  # Stop looking up/down
+            commands_sent = True
+        
+        # Move forward/backward based on distance
+        target_width = x2 - x1
+        target_height = y2 - y1
+        
+        # Calculate area percentage
+        area_percent = (target_width * target_height) / (self.frame_width * self.frame_height) * 100
+        
+        if area_percent < 10:  # Person is far, move forward
+            if self.last_movement_command != "forward":
+                await self.send_command("forward")
+                self.last_movement_command = "forward"
+                commands_sent = True
+        elif area_percent > 40:  # Person is too close, move backward
+            if self.last_movement_command != "backward":
+                await self.send_command("backward")
+                self.last_movement_command = "backward"
+                commands_sent = True
+        else:  # Good distance, stop moving
+            if self.last_movement_command in ["forward", "backward"]:
+                await self.send_command("DS")  # Stop forward/backward
+                self.last_movement_command = None
+                commands_sent = True
+        
+        if commands_sent:
+            self.last_movement_time = current_time
     
     async def analyze_frame_with_claude(self, frame):
         """Use Claude to analyze the image and identify intruders"""
@@ -439,7 +615,7 @@ Keep your response under 50 words and focus only on describing the person."""
                 # Update intruder description
                 self.intruder_description = intruder_description
                 
-                # Step 2: Generate warning message based on intruder description
+                # Step 2: Generate warning message based on intruder description and behavior
                 if "no people" not in intruder_description.lower() and len(intruder_description) > 10:
                     warning_message = await self.generate_warning_message(intruder_description)
                     
@@ -459,29 +635,35 @@ Keep your response under 50 words and focus only on describing the person."""
             await self.trigger_alert()  # Fall back to regular alert
     
     async def generate_warning_message(self, intruder_description):
-        """Generate personalized warning message based on intruder description"""
+        """Generate personalized warning message based on intruder description and behavior"""
         try:
+            # Enhance the prompt with behavior information
+            behavior_context = f"The person appears to be {self.intruder_behavior} and is {self.intruder_distance} from the camera."
+            
             # Use Claude to generate a personalized warning message
             warning_message = self.claude_client.messages.create(
                 model=self.claude_model,
                 max_tokens=1024,
-                system="You are a security robot confronting an intruder. You should generate a direct, authoritative warning message addressing the intruder based on their appearance. Be intimidating but not threatening. Your message should sound like it's being spoken by a security system.",
+                system="You are a security robot confronting an intruder. You should generate a direct, authoritative warning message addressing the intruder based on their appearance and behavior. Be intimidating but not threatening. Your message should sound like it's being spoken by a security system.",
                 messages=[
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"""Based on this description of an intruder, generate a warning message directly addressing them:
+                                "text": f"""Based on this description of an intruder:
 
 {intruder_description}
 
+Additional context: {behavior_context}
+
 Generate a security robot warning message that:
 1. Directly references the person's appearance (clothing, location, etc.)
-2. Sounds authoritative and firm
-3. Warns them they are being monitored/recorded
-4. Tells them to leave immediately or identify themselves
-5. Mentions that authorities have been notified
+2. Responds appropriately to their behavior (approaching, retreating, stationary)
+3. Sounds authoritative and firm
+4. Warns them they are being monitored/recorded
+5. Tells them to leave immediately or identify themselves
+6. Mentions that authorities have been notified
 
 Keep the message under 100 characters and make it sound like a direct verbal warning from a security robot.
 Do NOT use any placeholder expressions like [clothing]. Replace such placeholders with actual details from the description."""
@@ -604,34 +786,118 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             print(f"Speaking: {warning_message}")
             await self.send_command(f"speak:{warning_message}")
             
-            # Enhanced movement sequence - make the robot look more alert
-            # Turn head to look for intruder
-            await self.send_command("lookLeft")
-            await asyncio.sleep(0.5)
-            await self.send_command("LRstop")
-            await asyncio.sleep(0.5)
-            await self.send_command("lookRight")
-            await asyncio.sleep(0.5)
-            await self.send_command("LRstop")
+            # Enhanced movement sequence - more dynamic based on intruder behavior
+            if self.intruder_behavior == "approaching":
+                # More aggressive response if intruder is approaching
+                await self.send_command("steady")  # Stand steady
+                await asyncio.sleep(0.5)
+                
+                # Quick head movements to look alert
+                await self.send_command("lookLeft")
+                await asyncio.sleep(0.3)
+                await self.send_command("LRstop")
+                await asyncio.sleep(0.2)
+                await self.send_command("lookRight")
+                await asyncio.sleep(0.3)
+                await self.send_command("LRstop")
+                
+                # Jump to appear more intimidating if they're close
+                if self.intruder_distance == "close":
+                    await self.send_command("jump")
+                    await asyncio.sleep(1.0)
+                
+            elif self.intruder_behavior == "retreating":
+                # Follow if retreating
+                await self.send_command("forward")
+                await asyncio.sleep(1.0)
+                await self.send_command("DS")
+                
+                second_message = "Stop! I'm recording you. Security has been alerted."
+                await self.send_command(f"speak:{second_message}")
+                
+            else:
+                # Standard response for other behaviors
+                # Turn head to look for intruder
+                await self.send_command("lookLeft")
+                await asyncio.sleep(0.5)
+                await self.send_command("LRstop")
+                await asyncio.sleep(0.5)
+                await self.send_command("lookRight")
+                await asyncio.sleep(0.5)
+                await self.send_command("LRstop")
+                
+                # Turn body to face intruder
+                direction = random.choice(["left", "right"])
+                await self.send_command(direction)
+                await asyncio.sleep(0.8)
+                await self.send_command("TS")
             
-            # Turn body to face intruder
-            direction = random.choice(["left", "right"])
-            await self.send_command(direction)
-            await asyncio.sleep(0.8)
-            await self.send_command("TS")
+            # Second personalized message based on intruder behavior
+            second_messages = {
+                "approaching": [
+                    "Back away immediately! Security protocol activated.",
+                    "Stop approaching! You are trespassing.",
+                    "Halt! Do not come any closer.",
+                    "Warning: Defensive measures engaged.",
+                    "Security breach! Step back now."
+                ],
+                "retreating": [
+                    "I've recorded your face. Don't return.",
+                    "Keep moving. Exit this area now.",
+                    "Your escape is being tracked.",
+                    "Continue leaving. Police are on the way.",
+                    "Your retreat has been logged. Don't come back."
+                ],
+                "stationary": [
+                    "You are not authorized to be here.",
+                    "Identify yourself immediately.",
+                    "Remain where you are. Security en route.",
+                    "This area is restricted. State your purpose.",
+                    "Stand still. Awaiting security response."
+                ],
+                "moving_left": [
+                    "Stop moving to your right. You're being tracked.",
+                    "Movement detected. Remain still.",
+                    "Lateral movement monitored and recorded.",
+                    "Security tracking your sideways movement.",
+                    "Stop moving sideways. Identify yourself."
+                ],
+                "moving_right": [
+                    "Stop moving to your left. You're being tracked.",
+                    "Movement detected. Remain still.",
+                    "Lateral movement monitored and recorded.",
+                    "Security tracking your sideways movement.",
+                    "Stop moving sideways. Identify yourself."
+                ]
+            }
             
-            # Additional personalized message
-            second_message = random.choice([
+            # Select appropriate message based on behavior
+            behavior_messages = second_messages.get(self.intruder_behavior, [
                 "I've already called security.",
                 "This area is off-limits. Leave now.",
                 "Your face has been recorded.",
                 "Don't move! Authorities are on their way.",
                 "Security system activated. Please leave immediately."
             ])
+            
+            second_message = random.choice(behavior_messages)
             await self.send_command(f"speak:{second_message}")
             
-            # Bark again after turning
+            # Additional actions based on behavior
+            if self.intruder_behavior == "stationary" and random.random() < 0.5:
+                await self.send_command("handShake")
+                await asyncio.sleep(2.0)
+            
+            # Bark again after interactions
             await self.bark_sequence("excited")
+            
+            # Start tracking if not already tracking
+            if self.tracking_enabled and not self.is_tracking and self.target_person_box:
+                self.is_tracking = True
+                self.tracking_started = time.time()
+                
+                tracking_message = "Intruder tracking mode activated."
+                await self.send_command(f"speak:{tracking_message}")
             
             # Pause before finishing alert
             await asyncio.sleep(3.0)
@@ -658,12 +924,21 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
         """Disable watchdog mode"""
         self.watchdog_enabled = False
         self.toggle_patrol_mode(False)  # Also disable patrol mode
+        self.is_tracking = False
         print("Watchdog mode disabled")
         
     def toggle_alerts(self, enable):
         """Toggle alert system"""
         self.alerts_enabled = enable
         print(f"Alerts {'enabled' if enable else 'disabled'}")
+    
+    def toggle_tracking(self, enable):
+        """Toggle intruder tracking"""
+        self.tracking_enabled = enable
+        if not enable:
+            self.is_tracking = False
+            self.target_person_box = None
+        print(f"Intruder tracking {'enabled' if enable else 'disabled'}")
     
     def toggle_patrol_mode(self, enable):
         """Toggle patrol mode on/off"""
@@ -682,6 +957,38 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             print("Patrol mode disabled")
             
             # Patrol thread will exit by itself due to the flag check
+    
+    async def robot_reset_position(self):
+        """Reset robot to initial position"""
+        print("Resetting robot position...")
+        
+        # Stop any ongoing movements
+        await self.send_command("DS")  # Stop forward/backward
+        await self.send_command("TS")  # Stop left/right
+        await self.send_command("LRstop")  # Stop head left/right
+        await self.send_command("UDstop")  # Stop head up/down
+        
+        # Reset to initial position
+        await self.send_command("InitPos")
+        await asyncio.sleep(2.0)
+        
+        print("Robot position reset complete.")
+    
+    async def robot_middle_position(self):
+        """Move robot to middle position"""
+        print("Moving robot to middle position...")
+        
+        # Stop any ongoing movements
+        await self.send_command("DS")  # Stop forward/backward
+        await self.send_command("TS")  # Stop left/right
+        await self.send_command("LRstop")  # Stop head left/right
+        await self.send_command("UDstop")  # Stop head up/down
+        
+        # Go to middle position
+        await self.send_command("MiddlePos")
+        await asyncio.sleep(2.0)
+        
+        print("Robot moved to middle position.")
             
     async def patrol_sequence_loop(self):
         """Run the patrol sequence in a loop"""
@@ -763,6 +1070,10 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                     await asyncio.sleep(0.5)
                     await self.send_command("LRstop")
                     
+                    # Occasionally reset position 
+                    if random.random() < 0.2:  # 20% chance to reset
+                        await self.robot_middle_position()
+                    
                     # Occasionally bark during patrol
                     if random.random() < 0.3:  # 30% chance to bark
                         await self.bark_sequence("short")
@@ -804,14 +1115,20 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             # Use YOLO for person detection
                             person_detected = self.detect_persons_yolo(display_frame)
                             
+                            # If tracking enabled and have a target, follow person
+                            if self.tracking_enabled and self.is_tracking and self.target_person_box:
+                                asyncio.run(self.track_and_follow_person())
+                            
                             # Draw bounding boxes for detected persons
                             if person_detected and self.person_boxes:
                                 for box in self.person_boxes:
                                     x1, y1, x2, y2, conf = box
-                                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                    label = f"Person: {conf:.2f}"
+                                    # Highlight target person in red, others in green
+                                    color = (0, 0, 255) if box == self.target_person_box else (0, 255, 0)
+                                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                                    label = f"{'Target' if box == self.target_person_box else 'Person'}: {conf:.2f}"
                                     cv2.putText(display_frame, label, (x1, y1 - 10), 
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         else:
                             # Use motion detection as fallback
                             motion_detected = self.detect_motion(display_frame)
@@ -838,17 +1155,21 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                         cv2.putText(display_frame, detection_text, (10, 120), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         
+                        tracking_text = f"Tracking: {'ON' if self.is_tracking else 'OFF'}"
+                        cv2.putText(display_frame, tracking_text, (10, 150), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
                         patrol_text = f"Patrol Mode: {'ON' if self.patrol_mode else 'OFF'}"
-                        cv2.putText(display_frame, patrol_text, (10, 150), 
+                        cv2.putText(display_frame, patrol_text, (10, 180), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         
                         if self.use_yolo and self.person_detected:
-                            person_text = f"Person Detected! Count: {self.person_count}, Consecutive: {self.consecutive_person_detections}"
-                            cv2.putText(display_frame, person_text, (10, 180), 
+                            person_text = f"Person: Count={self.person_count}, Behavior={self.intruder_behavior}"
+                            cv2.putText(display_frame, person_text, (10, 210), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         elif not self.use_yolo and self.motion_detected:
                             motion_text = f"Motion Detected! Consecutive: {self.consecutive_detections}"
-                            cv2.putText(display_frame, motion_text, (10, 180), 
+                            cv2.putText(display_frame, motion_text, (10, 210), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                                         
                         # Show intruder description if available
@@ -868,10 +1189,10 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                                 lines.append(' '.join(current_line))
                                 
                             # Display description lines
-                            cv2.putText(display_frame, "Description:", (10, 210), 
+                            cv2.putText(display_frame, "Description:", (10, 240), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                             for i, line in enumerate(lines):
-                                cv2.putText(display_frame, line, (10, 240 + i*30), 
+                                cv2.putText(display_frame, line, (10, 270 + i*30), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                         
                         # Show generated warning if available
@@ -894,7 +1215,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             y_offset = 240
                             if self.intruder_description:
                                 # Adjust offset if description is shown
-                                y_offset = 240 + 30 * (len(self.intruder_description.split('\n')) + 1)
+                                y_offset = 270 + 30 * len(self.intruder_description.split('\n'))
                                 
                             cv2.putText(display_frame, "Warning Message:", (10, y_offset), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
@@ -907,7 +1228,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
                     # Add help text at the bottom
-                    help_text = "Controls: [e]nable/[d]isable watchdog, [a]lerts toggle, [p]atrol toggle, [q]uit"
+                    help_text = "Controls: [e]nable/[d]isable watchdog, [a]lerts, [t]racking, [p]atrol, [r]eset, [m]iddle pos, [j]ump, [q]uit"
                     cv2.putText(display_frame, help_text, (10, display_frame.shape[0] - 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
@@ -925,8 +1246,18 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             self.disable_watchdog()
                         elif key == ord('a'):
                             self.toggle_alerts(not self.alerts_enabled)
+                        elif key == ord('t'):
+                            self.toggle_tracking(not self.tracking_enabled)
                         elif key == ord('p'):
                             self.toggle_patrol_mode(not self.patrol_mode)
+                        elif key == ord('r'):
+                            asyncio.run(self.robot_reset_position())
+                        elif key == ord('m'):
+                            asyncio.run(self.robot_middle_position())
+                        elif key == ord('j'):
+                            asyncio.run(self.send_command("jump"))
+                        elif key == ord('h'):
+                            asyncio.run(self.send_command("handShake"))
                         elif key == ord('b'):
                             # Manual bark for testing
                             asyncio.run(self.bark_sequence("excited"))
@@ -954,14 +1285,26 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             video_thread.start()
             
             # Start with a greeting message
-            asyncio.run(self.send_command("speak:Security watchdog initialized and ready!"))
+            asyncio.run(self.send_command("speak:Enhanced security watchdog with intruder tracking initialized and ready!"))
+            
+            # Announce special features
+            if self.ai_enabled:
+                asyncio.run(self.send_command("speak:Claude AI integration active for personalized warnings."))
+            
+            if self.tracking_enabled:
+                asyncio.run(self.send_command("speak:Intruder tracking system online."))
             
             # Start frame processing
             print("\nStarting watchdog monitor...")
             print("Press 'e' to enable watchdog")
             print("Press 'd' to disable watchdog")
             print("Press 'a' to toggle alerts")
+            print("Press 't' to toggle tracking")
             print("Press 'p' to toggle patrol mode")
+            print("Press 'r' to reset position (InitPos)")
+            print("Press 'm' to go to middle position (MiddlePos)")
+            print("Press 'j' to jump")
+            print("Press 'h' to handshake")
             print("Press 'b' to trigger bark (test)")
             print("Press 'q' to quit")
             
@@ -982,11 +1325,13 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
 def main():
     load_dotenv()  
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Robot Watchdog with Prompt-Generated Warning Messages")
+    parser = argparse.ArgumentParser(description="Enhanced Robot Watchdog with Intruder Tracking")
     parser.add_argument("--ip", type=str, default=None,
                         help="Robot IP address (default: from ROBOT_IP_ADDRESS env var)")
     parser.add_argument("--enable", action="store_true", 
                         help="Enable watchdog mode on startup")
+    parser.add_argument("--track", action="store_true",
+                        help="Enable tracking on startup")
     parser.add_argument("--patrol", action="store_true",
                         help="Enable patrol mode on startup")
     parser.add_argument("--claude-key", type=str, default=None,
@@ -1020,6 +1365,10 @@ def main():
     # Enable watchdog if requested
     if args.enable:
         watchdog.enable_watchdog()
+        
+    # Enable tracking if requested
+    if args.track:
+        watchdog.toggle_tracking(True)
         
     # Enable patrol mode if requested
     if args.patrol and args.enable:
