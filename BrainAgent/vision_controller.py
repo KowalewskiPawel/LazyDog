@@ -103,10 +103,9 @@ class RobotWatchdogAI:
         self.behavior_confidence = 0
         self.intruder_distance = "unknown"  # far, medium, close
         
-        # Frame processing
-        self.frame_queue = Queue(maxsize=10)
-        self.recent_frames = []  # Store recent frames for recording
-        self.max_recent_frames = 50  # Max number of frames to keep
+        # Frame processing - optimized
+        self.frame_queue = Queue(maxsize=5)  # Reduced queue size to prevent memory build-up
+        self.frame_skip = 2  # Process only every Nth frame to improve performance
         
         # Fallback generic warnings (used when Claude is not available)
         self.generic_warnings = [
@@ -189,17 +188,18 @@ class RobotWatchdogAI:
         
         pattern = patterns.get(intensity, patterns["normal"])
         for duration, pause in pattern:
-            await self.send_command("bark")  # Using 'buzzer on' as bark
+            await self.send_command("buzzer on")  # Using 'buzzer on' as bark
             await asyncio.sleep(duration)
-            await self.send_command("bark")
+            await self.send_command("buzzer off")
             await asyncio.sleep(pause)
         
     def capture_video(self):
-        """Capture video frames from robot's stream"""
+        """Capture video frames from robot's stream - optimized for performance"""
         print(f"Starting video capture from {self.video_url}")
         
         retry_count = 0
         max_retries = 10
+        frame_count = 0
         
         while self.running and retry_count < max_retries:
             try:
@@ -221,11 +221,18 @@ class RobotWatchdogAI:
                         print("Failed to read frame, reconnecting...")
                         break
                     
-                    # Update frame dimensions
-                    self.frame_width = frame.shape[1]
-                    self.frame_height = frame.shape[0]
+                    # Update frame dimensions (only occasionally to save processing)
+                    if frame_count % 30 == 0:
+                        self.frame_width = frame.shape[1]
+                        self.frame_height = frame.shape[0]
                     
-                    # Store frame in queue
+                    frame_count += 1
+                    
+                    # Skip frames to improve performance
+                    if frame_count % self.frame_skip != 0:
+                        continue
+                    
+                    # Store frame in queue (with minimal copying)
                     if not self.frame_queue.full():
                         self.frame_queue.put(frame)
                     else:
@@ -235,13 +242,8 @@ class RobotWatchdogAI:
                         except:
                             pass
                     
-                    # Keep a list of recent frames (for recording)
-                    self.recent_frames.append(frame.copy())
-                    if len(self.recent_frames) > self.max_recent_frames:
-                        self.recent_frames.pop(0)
-                    
-                    # Throttle capture rate
-                    time.sleep(0.05)
+                    # Throttle capture rate slightly
+                    time.sleep(0.03)
                     
             except Exception as e:
                 print(f"Video capture error: {e}")
@@ -256,13 +258,13 @@ class RobotWatchdogAI:
         print("Video capture stopped")
     
     def detect_persons_yolo(self, frame):
-        """Detect persons in the frame using YOLO"""
+        """Detect persons in the frame using YOLO - optimized for performance"""
         if not self.watchdog_enabled or not self.use_yolo:
             return False
             
         try:
-            # Run YOLO detection
-            results = self.model(frame, classes=[0])  # Class 0 is person in COCO dataset
+            # Run YOLO detection with performance optimization
+            results = self.model(frame, classes=[0], verbose=False)  # Class 0 is person in COCO dataset
             
             # Process results
             self.person_boxes = []
@@ -305,19 +307,24 @@ class RobotWatchdogAI:
                 if (self.consecutive_person_detections >= self.person_detection_threshold and 
                         self.alerts_enabled and not self.is_alerting):
                     
-                    # If Claude is enabled, send frame for analysis
+                    # If Claude is enabled, send frame for analysis WITHOUT blocking
                     if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
                         # Run vision analysis in separate thread to avoid blocking
                         analysis_thread = threading.Thread(
-                            target=lambda: asyncio.run(self.analyze_frame_with_claude(frame.copy()))
+                            target=self._run_claude_analysis,
+                            args=(frame.copy(),)
                         )
                         analysis_thread.daemon = True
                         analysis_thread.start()
                     else:
-                        # Trigger alert without vision analysis
-                        asyncio.run(self.trigger_alert())
+                        # Trigger alert without vision analysis and without blocking
+                        alert_thread = threading.Thread(
+                            target=self._trigger_alert_worker
+                        )
+                        alert_thread.daemon = True
+                        alert_thread.start()
                 
-                # Save image on first detection
+                # Save image on first detection (non-blocking)
                 if not previous_person_detected:
                     self.save_detection_image(frame)
             else:
@@ -333,16 +340,36 @@ class RobotWatchdogAI:
                     print("Person lost while tracking, stopping tracking.")
                     self.is_tracking = False
                     self.target_person_box = None
-                    asyncio.run(self.send_command("DS"))  # Stop forward/backward
-                    asyncio.run(self.send_command("TS"))  # Stop left/right
+                    
+                    # Non-blocking stop commands
+                    stop_thread = threading.Thread(
+                        target=self._stop_movement_worker
+                    )
+                    stop_thread.daemon = True
+                    stop_thread.start()
             
             return self.person_detected
             
         except Exception as e:
             print(f"YOLO detection error: {e}")
-            import traceback
-            traceback.print_exc()
+            # Simplified error handling (removed traceback for better performance)
             return False
+    
+    def _run_claude_analysis(self, frame):
+        """Run Claude analysis in a separate thread to avoid blocking"""
+        asyncio.run(self.analyze_frame_with_claude(frame))
+    
+    def _trigger_alert_worker(self):
+        """Trigger alert in a non-blocking way"""
+        asyncio.run(self.trigger_alert())
+    
+    def _stop_movement_worker(self):
+        """Stop robot movement in a non-blocking way"""
+        async def stop_robot():
+            await self.send_command("DS")  # Stop forward/backward
+            await self.send_command("TS")  # Stop left/right
+        
+        asyncio.run(stop_robot())
 
     def select_target_person(self):
         """Select the best person to track based on size and position"""
@@ -480,7 +507,7 @@ class RobotWatchdogAI:
                     self.intruder_behavior = "unknown"
     
     async def track_and_follow_person(self):
-        """Track and follow the detected person"""
+        """Track and follow the detected person - optimized for smoother movement"""
         if not self.is_tracking or not self.target_person_box:
             return
         
@@ -500,65 +527,79 @@ class RobotWatchdogAI:
         offset_x = center_x - frame_center_x
         offset_y = center_y - frame_center_y
         
-        # Determine movement commands
+        # Determine movement commands with hysteresis to prevent jitter
+        # (only change direction when offset is significant)
         move_horizontal = None
         move_vertical = None
         
-        # Horizontal tracking (turn left/right)
-        if offset_x < -50:  # Person is to the left
+        # Horizontal tracking with wider threshold (turn left/right)
+        if offset_x < -70:  # Person is significantly to the left
             move_horizontal = "left"
-        elif offset_x > 50:  # Person is to the right
+        elif offset_x > 70:  # Person is significantly to the right
             move_horizontal = "right"
+        elif -30 <= offset_x <= 30:  # Person is centered horizontally
+            if self.last_movement_command in ["left", "right"]:
+                move_horizontal = "stop"  # Stop turning when centered
         
-        # Vertical tracking (look up/down)
-        if offset_y < -30:  # Person is above center
+        # Vertical tracking with wider threshold (look up/down)
+        if offset_y < -50:  # Person is significantly above center
             move_vertical = "lookUp"
-        elif offset_y > 30:  # Person is below center
+        elif offset_y > 50:  # Person is significantly below center
             move_vertical = "lookDown"
+        elif -20 <= offset_y <= 20:  # Person is centered vertically
+            if self.last_movement_command in ["lookUp", "lookDown"]:
+                move_vertical = "stop"  # Stop looking when centered
         
-        # Execute movement commands
-        commands_sent = False
+        # Queue to batch commands to send (to reduce network traffic)
+        commands_to_send = []
         
-        if move_horizontal and move_horizontal != self.last_movement_command:
-            await self.send_command(move_horizontal)
-            self.last_movement_command = move_horizontal
-            commands_sent = True
-        elif not move_horizontal and self.last_movement_command in ["left", "right"]:
-            await self.send_command("TS")  # Stop turning
+        # Handle horizontal movement
+        if move_horizontal == "left" and self.last_movement_command != "left":
+            commands_to_send.append("left")
+            self.last_movement_command = "left"
+        elif move_horizontal == "right" and self.last_movement_command != "right":
+            commands_to_send.append("right")
+            self.last_movement_command = "right"
+        elif move_horizontal == "stop" and self.last_movement_command in ["left", "right"]:
+            commands_to_send.append("TS")  # Stop turning
             self.last_movement_command = None
-            commands_sent = True
         
-        if move_vertical:
-            await self.send_command(move_vertical)
-            commands_sent = True
-        elif self.last_movement_command in ["lookUp", "lookDown"]:
-            await self.send_command("UDstop")  # Stop looking up/down
-            commands_sent = True
+        # Handle vertical movement
+        if move_vertical == "lookUp":
+            commands_to_send.append("lookUp")
+        elif move_vertical == "lookDown":
+            commands_to_send.append("lookDown")
+        elif move_vertical == "stop":
+            commands_to_send.append("UDstop")  # Stop looking up/down
         
         # Move forward/backward based on distance
         target_width = x2 - x1
         target_height = y2 - y1
         
-        # Calculate area percentage
+        # Calculate area percentage with smoothing
         area_percent = (target_width * target_height) / (self.frame_width * self.frame_height) * 100
         
-        if area_percent < 10:  # Person is far, move forward
+        # Forward/backward movement with hysteresis
+        if area_percent < 8:  # Person is definitely far, move forward
             if self.last_movement_command != "forward":
-                await self.send_command("forward")
+                commands_to_send.append("forward")
                 self.last_movement_command = "forward"
-                commands_sent = True
-        elif area_percent > 40:  # Person is too close, move backward
+        elif area_percent > 45:  # Person is definitely too close, move backward
             if self.last_movement_command != "backward":
-                await self.send_command("backward")
+                commands_to_send.append("backward")
                 self.last_movement_command = "backward"
-                commands_sent = True
-        else:  # Good distance, stop moving
+        elif 12 <= area_percent <= 35:  # Good distance, stop moving if we were moving
             if self.last_movement_command in ["forward", "backward"]:
-                await self.send_command("DS")  # Stop forward/backward
+                commands_to_send.append("DS")  # Stop forward/backward
                 self.last_movement_command = None
-                commands_sent = True
         
-        if commands_sent:
+        # Send commands efficiently
+        if commands_to_send:
+            for cmd in commands_to_send:
+                await self.send_command(cmd)
+                # Small delay between commands to let robot process
+                await asyncio.sleep(0.05)
+            
             self.last_movement_time = current_time
     
     async def analyze_frame_with_claude(self, frame):
@@ -687,63 +728,56 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             return random.choice(self.generic_warnings)
     
     def save_detection_image(self, frame):
-        """Save a detection image to disk"""
+        """Save a detection image to disk (screenshots only, no video)"""
+        try:
+            # Run in separate thread to avoid blocking main loop
+            save_thread = threading.Thread(
+                target=self._save_image_worker,
+                args=(frame.copy(),)  # Pass a copy to avoid memory issues
+            )
+            save_thread.daemon = True
+            save_thread.start()
+        except Exception as e:
+            print(f"Error starting save thread: {e}")
+            
+    def _save_image_worker(self, frame):
+        """Worker function to save image in separate thread"""
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"intruder_{timestamp}.jpg"
             filepath = os.path.join(self.save_dir, filename)
             
-            # Create a copy for saving
-            save_frame = frame.copy()
-            
             # Add timestamp to the image
             timestamp_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(save_frame, timestamp_text, (10, save_frame.shape[0] - 10), 
+            cv2.putText(frame, timestamp_text, (10, frame.shape[0] - 10), 
                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
             
             # Draw bounding boxes for persons if using YOLO
             if self.use_yolo and self.person_boxes:
                 for box in self.person_boxes:
                     x1, y1, x2, y2, conf = box
-                    cv2.rectangle(save_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     label = f"Person: {conf:.2f}"
-                    cv2.putText(save_frame, label, (x1, y1 - 10), 
+                    cv2.putText(frame, label, (x1, y1 - 10), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
-            # Save image
-            cv2.imwrite(filepath, save_frame)
-            print(f"Saved detection image to {filepath}")
+            # Add behavior and description if available
+            info_text = f"Behavior: {self.intruder_behavior}, Distance: {self.intruder_distance}"
+            cv2.putText(frame, info_text, (10, 30), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             
-            # Save a short video clip if we have enough frames
-            if len(self.recent_frames) > 10:
-                self.save_detection_video(timestamp)
+            if self.intruder_description:
+                desc_lines = self.intruder_description.split('\n')
+                for i, line in enumerate(desc_lines[:3]):  # Limit to first 3 lines
+                    cv2.putText(frame, line, (10, 60 + i*20), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            
+            # Save image with optimized quality (95%)
+            cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"Saved detection image to {filepath}")
                 
         except Exception as e:
             print(f"Error saving detection image: {e}")
-            
-    def save_detection_video(self, timestamp):
-        """Save a short video of the detection"""
-        try:
-            filename = f"intruder_{timestamp}.mp4"
-            filepath = os.path.join(self.save_dir, filename)
-            
-            # Get video properties from the first frame
-            height, width = self.recent_frames[0].shape[:2]
-            
-            # Create video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(filepath, fourcc, 10, (width, height))
-            
-            # Write frames to video
-            for frame in self.recent_frames:
-                out.write(frame)
-                
-            # Release video writer
-            out.release()
-            print(f"Saved detection video to {filepath}")
-            
-        except Exception as e:
-            print(f"Error saving detection video: {e}")
     
     async def trigger_alert(self, warning_message=None):
         """Trigger alert when person is detected"""
@@ -1088,10 +1122,18 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
         print("Patrol sequence loop ended")
         
     def process_frames(self):
-        """Process frames in the queue"""
+        """Process frames in the queue - optimized for performance"""
         print("Starting frame processing...")
         
         display_window = True  # Set to False to disable GUI
+        
+        # For tracking performance
+        frame_count = 0
+        last_fps_time = time.time()
+        fps = 0
+        
+        # For tracking movement
+        movement_thread = None
         
         if display_window:
             cv2.namedWindow("Watchdog Monitor", cv2.WINDOW_NORMAL)
@@ -1106,8 +1148,19 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                     if frame is None:
                         continue
                     
-                    # Clone the frame for display
-                    display_frame = frame.copy()
+                    # Update FPS counter
+                    frame_count += 1
+                    current_time = time.time()
+                    if current_time - last_fps_time >= 1.0:
+                        fps = frame_count
+                        frame_count = 0
+                        last_fps_time = current_time
+                    
+                    # Optimize frame copy (only copy if we need to display)
+                    if display_window:
+                        display_frame = frame.copy()
+                    else:
+                        display_frame = frame  # Just use reference if not displaying
                     
                     # Detect intruders if watchdog is enabled
                     if self.watchdog_enabled:
@@ -1115,12 +1168,18 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             # Use YOLO for person detection
                             person_detected = self.detect_persons_yolo(display_frame)
                             
-                            # If tracking enabled and have a target, follow person
-                            if self.tracking_enabled and self.is_tracking and self.target_person_box:
-                                asyncio.run(self.track_and_follow_person())
+                            # If tracking enabled and have a target, follow person (non-blocking)
+                            if (self.tracking_enabled and self.is_tracking and self.target_person_box and 
+                                (movement_thread is None or not movement_thread.is_alive())):
+                                
+                                movement_thread = threading.Thread(
+                                    target=lambda: asyncio.run(self.track_and_follow_person())
+                                )
+                                movement_thread.daemon = True
+                                movement_thread.start()
                             
                             # Draw bounding boxes for detected persons
-                            if person_detected and self.person_boxes:
+                            if display_window and person_detected and self.person_boxes:
                                 for box in self.person_boxes:
                                     x1, y1, x2, y2, conf = box
                                     # Highlight target person in red, others in green
@@ -1134,103 +1193,52 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             motion_detected = self.detect_motion(display_frame)
                             
                             # Draw motion area if detected
-                            if motion_detected and self.motion_area:
+                            if display_window and motion_detected and self.motion_area:
                                 x, y, w, h = self.motion_area
                                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                         
-                        # Add status text
-                        status_text = f"Watchdog: {'ENABLED' if self.watchdog_enabled else 'DISABLED'}"
-                        cv2.putText(display_frame, status_text, (10, 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        alert_text = f"Alerts: {'ON' if self.alerts_enabled else 'OFF'}"
-                        cv2.putText(display_frame, alert_text, (10, 60), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        ai_text = f"AI Vision: {'ON' if self.ai_enabled else 'OFF'}"
-                        cv2.putText(display_frame, ai_text, (10, 90), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        detection_text = f"Detection: {'YOLO' if self.use_yolo else 'Motion'}"
-                        cv2.putText(display_frame, detection_text, (10, 120), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        tracking_text = f"Tracking: {'ON' if self.is_tracking else 'OFF'}"
-                        cv2.putText(display_frame, tracking_text, (10, 150), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        patrol_text = f"Patrol Mode: {'ON' if self.patrol_mode else 'OFF'}"
-                        cv2.putText(display_frame, patrol_text, (10, 180), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        if self.use_yolo and self.person_detected:
-                            person_text = f"Person: Count={self.person_count}, Behavior={self.intruder_behavior}"
-                            cv2.putText(display_frame, person_text, (10, 210), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        elif not self.use_yolo and self.motion_detected:
-                            motion_text = f"Motion Detected! Consecutive: {self.consecutive_detections}"
-                            cv2.putText(display_frame, motion_text, (10, 210), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                                        
-                        # Show intruder description if available
-                        if self.intruder_description and "no people" not in self.intruder_description.lower():
-                            # Split into multiple lines if too long
-                            words = self.intruder_description.split()
-                            lines = []
-                            current_line = []
+                        # Only add status text if displaying
+                        if display_window:
+                            # Add status text (simplified)
+                            status_text = f"FPS: {fps} | Watchdog: ON | Tracking: {'ON' if self.is_tracking else 'OFF'} | Patrol: {'ON' if self.patrol_mode else 'OFF'}"
+                            cv2.putText(display_frame, status_text, (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                             
-                            for word in words:
-                                current_line.append(word)
-                                if len(' '.join(current_line)) > 60:  # Line length limit
-                                    lines.append(' '.join(current_line[:-1]))
-                                    current_line = [word]
+                            if self.use_yolo and self.person_detected:
+                                person_text = f"Person: Count={self.person_count}, Behavior={self.intruder_behavior}, Dist={self.intruder_distance}"
+                                cv2.putText(display_frame, person_text, (10, 60), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                             
-                            if current_line:
-                                lines.append(' '.join(current_line))
+                            # Show compact intruder info
+                            if self.intruder_description and "no people" not in self.intruder_description.lower():
+                                if len(self.intruder_description) > 60:
+                                    desc_text = self.intruder_description[:57] + "..."
+                                else:
+                                    desc_text = self.intruder_description
                                 
-                            # Display description lines
-                            cv2.putText(display_frame, "Description:", (10, 240), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
-                            for i, line in enumerate(lines):
-                                cv2.putText(display_frame, line, (10, 270 + i*30), 
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                        
-                        # Show generated warning if available
-                        if self.generated_warning:
-                            # Split into multiple lines if too long
-                            words = self.generated_warning.split()
-                            lines = []
-                            current_line = []
+                                cv2.putText(display_frame, f"Description: {desc_text}", (10, 90), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                             
-                            for word in words:
-                                current_line.append(word)
-                                if len(' '.join(current_line)) > 60:  # Line length limit
-                                    lines.append(' '.join(current_line[:-1]))
-                                    current_line = [word]
-                            
-                            if current_line:
-                                lines.append(' '.join(current_line))
+                            # Show compact warning message
+                            if self.generated_warning:
+                                if len(self.generated_warning) > 60:
+                                    warning_text = self.generated_warning[:57] + "..."
+                                else:
+                                    warning_text = self.generated_warning
                                 
-                            # Display warning lines
-                            y_offset = 240
-                            if self.intruder_description:
-                                # Adjust offset if description is shown
-                                y_offset = 270 + 30 * len(self.intruder_description.split('\n'))
-                                
-                            cv2.putText(display_frame, "Warning Message:", (10, y_offset), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
-                            for i, line in enumerate(lines):
-                                cv2.putText(display_frame, line, (10, y_offset + 30 + i*30), 
+                                cv2.putText(display_frame, f"Warning: {warning_text}", (10, 120), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                     else:
-                        status_text = "Watchdog: DISABLED"
-                        cv2.putText(display_frame, status_text, (10, 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        if display_window:
+                            status_text = "Watchdog: DISABLED"
+                            cv2.putText(display_frame, status_text, (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
-                    # Add help text at the bottom
-                    help_text = "Controls: [e]nable/[d]isable watchdog, [a]lerts, [t]racking, [p]atrol, [r]eset, [m]iddle pos, [j]ump, [q]uit"
-                    cv2.putText(display_frame, help_text, (10, display_frame.shape[0] - 20), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Add help text at the bottom if displaying
+                    if display_window:
+                        help_text = "Controls: [e]nable/[d]isable, [a]lerts, [t]rack, [p]atrol, [r]eset, [m]iddle, [j]ump, [h]andshake, [q]uit"
+                        cv2.putText(display_frame, help_text, (10, display_frame.shape[0] - 20), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
                     # Display the frame
                     if display_window:
@@ -1251,25 +1259,48 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                         elif key == ord('p'):
                             self.toggle_patrol_mode(not self.patrol_mode)
                         elif key == ord('r'):
-                            asyncio.run(self.robot_reset_position())
+                            # Non-blocking reset
+                            reset_thread = threading.Thread(
+                                target=lambda: asyncio.run(self.robot_reset_position())
+                            )
+                            reset_thread.daemon = True
+                            reset_thread.start()
                         elif key == ord('m'):
-                            asyncio.run(self.robot_middle_position())
+                            # Non-blocking middle position
+                            middle_thread = threading.Thread(
+                                target=lambda: asyncio.run(self.robot_middle_position())
+                            )
+                            middle_thread.daemon = True
+                            middle_thread.start()
                         elif key == ord('j'):
-                            asyncio.run(self.send_command("jump"))
+                            # Non-blocking jump
+                            jump_thread = threading.Thread(
+                                target=lambda: asyncio.run(self.send_command("jump"))
+                            )
+                            jump_thread.daemon = True
+                            jump_thread.start()
                         elif key == ord('h'):
-                            asyncio.run(self.send_command("handShake"))
+                            # Non-blocking handshake
+                            handshake_thread = threading.Thread(
+                                target=lambda: asyncio.run(self.send_command("handShake"))
+                            )
+                            handshake_thread.daemon = True
+                            handshake_thread.start()
                         elif key == ord('b'):
-                            # Manual bark for testing
-                            asyncio.run(self.bark_sequence("excited"))
+                            # Non-blocking bark test
+                            bark_thread = threading.Thread(
+                                target=lambda: asyncio.run(self.bark_sequence("excited"))
+                            )
+                            bark_thread.daemon = True
+                            bark_thread.start()
                 
-                # Sleep briefly to avoid excessive CPU usage
-                time.sleep(0.03)
+                # Very short sleep to allow task switching
+                time.sleep(0.01)
                 
             except Exception as e:
                 print(f"Frame processing error: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(1)
+                # No traceback for performance
+                time.sleep(0.5)
         
         # Clean up
         if display_window:
@@ -1340,6 +1371,10 @@ def main():
                         help="Disable YOLO and use motion detection instead")
     parser.add_argument("--nodisplay", action="store_true",
                         help="Run without display window (headless mode)")
+    parser.add_argument("--frame-skip", type=int, default=2,
+                        help="Process only every Nth frame (higher values = better performance)")
+    parser.add_argument("--high-performance", action="store_true",
+                        help="Enable high performance mode (reduces quality but increases speed)")
     
     args = parser.parse_args()
     
@@ -1357,6 +1392,19 @@ def main():
     
     # Create and run watchdog
     watchdog = RobotWatchdogAI(robot_ip, claude_api_key)
+    
+    # Performance tuning options
+    if args.frame_skip:
+        watchdog.frame_skip = args.frame_skip
+        print(f"Setting frame skip to {args.frame_skip} (processing 1/{args.frame_skip} frames)")
+    
+    if args.high_performance:
+        # Increase performance mode settings
+        watchdog.frame_skip = max(3, watchdog.frame_skip)  # Skip more frames
+        watchdog.movement_cooldown = 1.5  # Longer delay between movements
+        watchdog.vision_analysis_interval = 30  # Less frequent Claude analysis
+        watchdog.person_detection_threshold = 5  # Require more detections before alerting
+        print("High performance mode enabled - prioritizing speed over responsiveness")
     
     # Disable YOLO if requested
     if args.no_yolo:
