@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Enhanced Robot Watchdog with YOLO person detection, Claude-generated warnings, and intruder tracking
+# Enhanced Robot Watchdog with YOLO person detection, Claude-generated warnings, intruder tracking, and voice challenge
 
 import cv2
 import time
@@ -17,6 +17,9 @@ import base64
 import anthropic  # pip install anthropic
 from dotenv import load_dotenv
 from ultralytics import YOLO  # pip install ultralytics
+import speech_recognition as sr  # pip install SpeechRecognition
+import pyttsx3  # pip install pyttsx3
+import concurrent.futures
 
 class RobotWatchdogAI:
     def __init__(self, robot_ip, claude_api_key=None):
@@ -44,6 +47,35 @@ class RobotWatchdogAI:
         self.person_detection_cooldown = 30  # Seconds between person alerts
         self.last_person_time = 0
         self.use_yolo = self.model is not None
+        
+        # NEW: Voice challenge settings
+        self.voice_challenge_enabled = False  # Disabled by default due to mic issues
+        self.challenge_active = False
+        self.challenge_passed = False
+        self.challenge_timeout = 60  # 60 seconds to respond
+        self.challenge_start_time = 0
+        self.recognizer = None
+        self.voice_engine = None
+        try:
+            self.recognizer = sr.Recognizer()
+            self.voice_engine = pyttsx3.init()
+            self.voice_engine.setProperty('rate', 150)  # Speed of speech
+        except Exception as e:
+            print(f"Speech recognition initialization error: {e}")
+            print("Voice challenge will be disabled.")
+            self.voice_challenge_enabled = False
+        self.voice_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.voice_recognition_timeout = 10  # seconds to wait for response
+        
+        # Security questions and correct answers
+        self.security_questions = [
+            {"question": "What is the password?", "answer": "bluesky"},
+            {"question": "Who are you?", "answer": "authorized"},
+            {"question": "What is today's code word?", "answer": "sunshine"},
+            {"question": "State your security clearance level.", "answer": "alpha"},
+            {"question": "What department do you work for?", "answer": "engineering"}
+        ]
+        self.current_question = None
         
         # NEW: Intruder tracking settings
         self.tracking_enabled = True
@@ -117,6 +149,15 @@ class RobotWatchdogAI:
         ]
         self.last_message_index = -1
         
+        # NEW: Angry messages for failed challenge responses
+        self.angry_messages = [
+            "I've already called the police! Get out now!",
+            "This is your final warning! Leave immediately!",
+            "Security measures activated. You need to leave right now!",
+            "Stop what you're doing and exit the premises immediately!",
+            "You are trespassing! Get out or there will be consequences!"
+        ]
+        
         # Create folder for saving detection images
         self.save_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "intruder_images")
         os.makedirs(self.save_dir, exist_ok=True)
@@ -133,6 +174,7 @@ class RobotWatchdogAI:
         print(f"AI Vision: {'Enabled' if self.ai_enabled else 'Disabled'}")
         print(f"Person Detection: {'YOLO' if self.use_yolo else 'Motion-based (fallback)'}")
         print(f"Intruder Tracking: {'Enabled' if self.tracking_enabled else 'Disabled'}")
+        print(f"Voice Challenge: {'Enabled' if self.voice_challenge_enabled else 'Disabled'}")
         
     async def connect_websocket(self):
         """Connect to robot's WebSocket server"""
@@ -188,11 +230,61 @@ class RobotWatchdogAI:
         
         pattern = patterns.get(intensity, patterns["normal"])
         for duration, pause in pattern:
-            await self.send_command("buzzer on")  # Using 'buzzer on' as bark
+            await self.send_command("buzzer 1")  # Using 'buzzer on' as bark
             await asyncio.sleep(duration)
-            await self.send_command("buzzer off")
+            await self.send_command("buzzer 0")
             await asyncio.sleep(pause)
-        
+    
+    def speak(self, text):
+        """Text-to-speech function"""
+        def _speak_worker():
+            print(f"Robot says: {text}")
+            # Convert speak command to match the robot's command format
+            try:
+                asyncio.run(self.send_command(f"speak:{text}"))
+            except Exception as e:
+                print(f"Speech command error: {e}")
+            
+        # Run speech in a separate thread to avoid blocking
+        self.voice_executor.submit(_speak_worker)
+    
+    def listen(self, timeout=10):
+        """Listen for voice input with timeout"""
+        if not self.recognizer:
+            print("Speech recognition not available")
+            return ""
+            
+        try:
+            # Use with context for microphone to ensure proper resource cleanup
+            with sr.Microphone() as source:
+                print("Listening for response...")
+                try:
+                    # Adjust for ambient noise
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    # Listen for audio with timeout
+                    audio = self.recognizer.listen(source, timeout=timeout)
+                    # Convert speech to text
+                    response = self.recognizer.recognize_google(audio)
+                    print(f"Heard: {response}")
+                    return response.lower()
+                except sr.WaitTimeoutError:
+                    print("No audio detected within timeout")
+                    return ""
+                except sr.UnknownValueError:
+                    print("Could not understand audio")
+                    return ""
+                except sr.RequestError as e:
+                    print(f"Could not request results from speech recognition service: {e}")
+                    return ""
+                except Exception as e:
+                    print(f"Audio processing error: {e}")
+                    return ""
+        except Exception as e:
+            print(f"Microphone error: {e}")
+            # Disable voice challenge due to microphone problems
+            self.voice_challenge_enabled = False
+            return ""
+    
     def capture_video(self):
         """Capture video frames from robot's stream - optimized for performance"""
         print(f"Starting video capture from {self.video_url}")
@@ -303,26 +395,35 @@ class RobotWatchdogAI:
                 if self.target_person_box:
                     self.analyze_intruder_behavior()
                 
-                # Check if we should trigger alert
+                # Check if we should trigger challenge or alert
                 if (self.consecutive_person_detections >= self.person_detection_threshold and 
                         self.alerts_enabled and not self.is_alerting):
                     
-                    # If Claude is enabled, send frame for analysis WITHOUT blocking
-                    if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
-                        # Run vision analysis in separate thread to avoid blocking
-                        analysis_thread = threading.Thread(
-                            target=self._run_claude_analysis,
-                            args=(frame.copy(),)
+                    # If voice challenge is enabled, start the challenge
+                    if self.voice_challenge_enabled and not self.challenge_active and not self.challenge_passed:
+                        # Run challenge in separate thread to avoid blocking
+                        challenge_thread = threading.Thread(
+                            target=self._run_voice_challenge
                         )
-                        analysis_thread.daemon = True
-                        analysis_thread.start()
-                    else:
-                        # Trigger alert without vision analysis and without blocking
-                        alert_thread = threading.Thread(
-                            target=self._trigger_alert_worker
-                        )
-                        alert_thread.daemon = True
-                        alert_thread.start()
+                        challenge_thread.daemon = True
+                        challenge_thread.start()
+                    elif not self.voice_challenge_enabled or self.challenge_passed:
+                        # If Claude is enabled, send frame for analysis WITHOUT blocking
+                        if self.ai_enabled and time.time() - self.last_vision_analysis_time > self.vision_analysis_interval:
+                            # Run vision analysis in separate thread to avoid blocking
+                            analysis_thread = threading.Thread(
+                                target=self._run_claude_analysis,
+                                args=(frame.copy(),)
+                            )
+                            analysis_thread.daemon = True
+                            analysis_thread.start()
+                        else:
+                            # Trigger alert without vision analysis and without blocking
+                            alert_thread = threading.Thread(
+                                target=self._trigger_alert_worker
+                            )
+                            alert_thread.daemon = True
+                            alert_thread.start()
                 
                 # Save image on first detection (non-blocking)
                 if not previous_person_detected:
@@ -355,13 +456,91 @@ class RobotWatchdogAI:
             # Simplified error handling (removed traceback for better performance)
             return False
     
+    def _run_voice_challenge(self):
+        """Run voice challenge in a separate thread"""
+        self.challenge_active = True
+        self.challenge_start_time = time.time()
+        
+        # Use threading event to create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Use robot's head movements to look at the person
+            loop.run_until_complete(self.send_command("lookLeft"))
+            time.sleep(0.3)
+            loop.run_until_complete(self.send_command("LRstop"))
+            time.sleep(0.2)
+            loop.run_until_complete(self.send_command("lookRight"))
+            time.sleep(0.3)
+            loop.run_until_complete(self.send_command("LRstop"))
+            
+            # Choose a random security question
+            self.current_question = random.choice(self.security_questions)
+            
+            # Ask the security question (short version)
+            self.speak(f"{self.current_question['question']}")
+            
+            # Wait briefly to ensure speech completes
+            time.sleep(2)
+            
+            # Listen for answer with timeout
+            response = self.listen(timeout=self.voice_recognition_timeout)
+            
+            # Check if answer is correct (with some flexibility)
+            if response and (response == self.current_question['answer'].lower() or 
+                            self.current_question['answer'].lower() in response):
+                self.speak("Access granted.")
+                self.challenge_passed = True
+                loop.run_until_complete(self.send_command("light green"))  # Green light for success
+                time.sleep(1)
+                loop.run_until_complete(self.send_command("light off"))
+            else:
+                # If microphone failed, just skip to alert
+                if not self.voice_challenge_enabled:
+                    self._trigger_alert_worker(failed_challenge=True)
+                else:
+                    # Give them one more chance with a shorter prompt
+                    time.sleep(1)
+                    self.speak(f"Repeat: {self.current_question['question']}")
+                    
+                    response = self.listen(timeout=self.voice_recognition_timeout)
+                    
+                    if response and (response == self.current_question['answer'].lower() or 
+                                   self.current_question['answer'].lower() in response):
+                        self.speak("Access granted.")
+                        self.challenge_passed = True
+                        loop.run_until_complete(self.send_command("light green"))
+                        time.sleep(1)
+                        loop.run_until_complete(self.send_command("light off"))
+                    else:
+                        # Failed challenge, trigger alert
+                        self.speak("Intruder detected.")
+                        self._trigger_alert_worker(failed_challenge=True)
+        except Exception as e:
+            print(f"Voice challenge error: {e}")
+            # Fall back to default alert
+            self._trigger_alert_worker()
+        finally:
+            self.challenge_active = False
+            loop.close()
+        
+    def check_challenge_timeout(self):
+        """Check if the voice challenge has timed out"""
+        if self.challenge_active:
+            elapsed_time = time.time() - self.challenge_start_time
+            if elapsed_time > self.challenge_timeout:
+                print("Challenge response timeout")
+                self.challenge_active = False
+                self._trigger_alert_worker(failed_challenge=True)
+
     def _run_claude_analysis(self, frame):
         """Run Claude analysis in a separate thread to avoid blocking"""
         asyncio.run(self.analyze_frame_with_claude(frame))
     
-    def _trigger_alert_worker(self):
+    def _trigger_alert_worker(self, failed_challenge=False):
         """Trigger alert in a non-blocking way"""
-        asyncio.run(self.trigger_alert())
+        asyncio.run(self.trigger_alert(failed_challenge=failed_challenge))
     
     def _stop_movement_worker(self):
         """Stop robot movement in a non-blocking way"""
@@ -779,7 +958,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
         except Exception as e:
             print(f"Error saving detection image: {e}")
     
-    async def trigger_alert(self, warning_message=None):
+    async def trigger_alert(self, warning_message=None, failed_challenge=False):
         """Trigger alert when person is detected"""
         current_time = time.time()
         
@@ -798,12 +977,12 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
         
         # Start alert sequence in a separate thread
         alert_thread = threading.Thread(
-            target=lambda: asyncio.run(self.alert_sequence(warning_message, was_patrolling))
+            target=lambda: asyncio.run(self.alert_sequence(warning_message, was_patrolling, failed_challenge))
         )
         alert_thread.daemon = True
         alert_thread.start()
     
-    async def alert_sequence(self, warning_message=None, resume_patrol=False):
+    async def alert_sequence(self, warning_message=None, resume_patrol=False, failed_challenge=False):
         """Run the alert sequence"""
         try:
             print("⚠️ ALERT! Intruder detected!")
@@ -811,8 +990,11 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             # First, make the robot bark
             await self.bark_sequence("alert")
             
-            # Use provided warning message or generic fallback
-            if not warning_message:
+            # Use provided warning message, generic fallback, or failure message for challenge
+            if failed_challenge:
+                # Use more aggressive message for failed challenge
+                warning_message = random.choice(self.angry_messages)
+            elif not warning_message:
                 # Use generic warning message
                 warning_message = random.choice(self.generic_warnings)
             
@@ -820,20 +1002,18 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             print(f"Speaking: {warning_message}")
             await self.send_command(f"speak:{warning_message}")
             
+            # Flash red lights
+            for _ in range(3):  # Reduced from 5 to be less verbose
+                await self.send_command("light red")
+                await asyncio.sleep(0.3)
+                await self.send_command("light off")
+                await asyncio.sleep(0.2)
+            
             # Enhanced movement sequence - more dynamic based on intruder behavior
             if self.intruder_behavior == "approaching":
                 # More aggressive response if intruder is approaching
                 await self.send_command("steady")  # Stand steady
                 await asyncio.sleep(0.5)
-                
-                # Quick head movements to look alert
-                await self.send_command("lookLeft")
-                await asyncio.sleep(0.3)
-                await self.send_command("LRstop")
-                await asyncio.sleep(0.2)
-                await self.send_command("lookRight")
-                await asyncio.sleep(0.3)
-                await self.send_command("LRstop")
                 
                 # Jump to appear more intimidating if they're close
                 if self.intruder_distance == "close":
@@ -845,9 +1025,6 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                 await self.send_command("forward")
                 await asyncio.sleep(1.0)
                 await self.send_command("DS")
-                
-                second_message = "Stop! I'm recording you. Security has been alerted."
-                await self.send_command(f"speak:{second_message}")
                 
             else:
                 # Standard response for other behaviors
@@ -866,72 +1043,53 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                 await asyncio.sleep(0.8)
                 await self.send_command("TS")
             
-            # Second personalized message based on intruder behavior
-            second_messages = {
-                "approaching": [
-                    "Back away immediately! Security protocol activated.",
-                    "Stop approaching! You are trespassing.",
-                    "Halt! Do not come any closer.",
-                    "Warning: Defensive measures engaged.",
-                    "Security breach! Step back now."
-                ],
-                "retreating": [
-                    "I've recorded your face. Don't return.",
-                    "Keep moving. Exit this area now.",
-                    "Your escape is being tracked.",
-                    "Continue leaving. Police are on the way.",
-                    "Your retreat has been logged. Don't come back."
-                ],
-                "stationary": [
-                    "You are not authorized to be here.",
-                    "Identify yourself immediately.",
-                    "Remain where you are. Security en route.",
-                    "This area is restricted. State your purpose.",
-                    "Stand still. Awaiting security response."
-                ],
-                "moving_left": [
-                    "Stop moving to your right. You're being tracked.",
-                    "Movement detected. Remain still.",
-                    "Lateral movement monitored and recorded.",
-                    "Security tracking your sideways movement.",
-                    "Stop moving sideways. Identify yourself."
-                ],
-                "moving_right": [
-                    "Stop moving to your left. You're being tracked.",
-                    "Movement detected. Remain still.",
-                    "Lateral movement monitored and recorded.",
-                    "Security tracking your sideways movement.",
-                    "Stop moving sideways. Identify yourself."
-                ]
-            }
-            
-            # Select appropriate message based on behavior
-            behavior_messages = second_messages.get(self.intruder_behavior, [
-                "I've already called security.",
-                "This area is off-limits. Leave now.",
-                "Your face has been recorded.",
-                "Don't move! Authorities are on their way.",
-                "Security system activated. Please leave immediately."
-            ])
-            
-            second_message = random.choice(behavior_messages)
-            await self.send_command(f"speak:{second_message}")
-            
-            # Additional actions based on behavior
-            if self.intruder_behavior == "stationary" and random.random() < 0.5:
-                await self.send_command("handShake")
-                await asyncio.sleep(2.0)
+            # Only say a second message if the challenge failed (reduce verbosity)
+            if failed_challenge:
+                # Select appropriate message based on behavior
+                second_messages = {
+                    "approaching": [
+                        "Back off now! Police coming!",
+                        "Get back! Final warning!",
+                        "Stop right there!",
+                        "Get out now!"
+                    ],
+                    "retreating": [
+                        "Get out! Don't come back!",
+                        "Run! Police on their way!",
+                        "Your face is in the system!",
+                        "Keep moving!"
+                    ],
+                    "stationary": [
+                        "Why are you still here?!",
+                        "Get out now!",
+                        "10 seconds before lockdown!",
+                        "Leave immediately!"
+                    ]
+                }
+                
+                # Get messages for the current behavior, or use default messages
+                behavior_messages = second_messages.get(self.intruder_behavior, [
+                    "Police notified!",
+                    "Leave now!",
+                    "Face recorded!",
+                    "Get out!"
+                ])
+                
+                second_message = random.choice(behavior_messages)
+                await self.send_command(f"speak:{second_message}")
+                
+                # Additional actions based on behavior
+                if self.intruder_behavior == "stationary":
+                    await self.send_command("handShake")
+                    await asyncio.sleep(2.0)
             
             # Bark again after interactions
             await self.bark_sequence("excited")
             
-            # Start tracking if not already tracking
+            # Start tracking if not already tracking (without announcement)
             if self.tracking_enabled and not self.is_tracking and self.target_person_box:
                 self.is_tracking = True
                 self.tracking_started = time.time()
-                
-                tracking_message = "Intruder tracking mode activated."
-                await self.send_command(f"speak:{tracking_message}")
             
             # Pause before finishing alert
             await asyncio.sleep(3.0)
@@ -973,6 +1131,19 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             self.is_tracking = False
             self.target_person_box = None
         print(f"Intruder tracking {'enabled' if enable else 'disabled'}")
+    
+    def toggle_voice_challenge(self, enable):
+        """Toggle voice challenge feature"""
+        # Only enable if speech recognition is available
+        if enable and not self.recognizer:
+            print("Cannot enable voice challenge - speech recognition not available")
+            return
+            
+        self.voice_challenge_enabled = enable
+        if not enable:
+            self.challenge_active = False
+            self.challenge_passed = False
+        print(f"Voice challenge {'enabled' if enable else 'disabled'}")
     
     def toggle_patrol_mode(self, enable):
         """Toggle patrol mode on/off"""
@@ -1038,6 +1209,8 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
         ]
         
         # Run patrol loop until patrol mode is disabled
+        patrol_counter = 0  # Counter to control announcement frequency
+        
         while self.running and self.patrol_mode and self.watchdog_enabled and not self.is_alerting:
             try:
                 current_time = time.time()
@@ -1047,8 +1220,10 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                     print("Performing patrol movement")
                     self.last_patrol_time = current_time
                     
-                    # Announce patrol
-                    await self.send_command("speak:Patrolling the area")
+                    # Only announce patrol occasionally to reduce verbosity (every 3rd patrol)
+                    patrol_counter += 1
+                    if patrol_counter % 3 == 0:
+                        await self.send_command("speak:Patrolling")
                     
                     # Choose movement pattern
                     if self.patrol_random:
@@ -1162,6 +1337,9 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                     else:
                         display_frame = frame  # Just use reference if not displaying
                     
+                    # Check for voice challenge timeout
+                    self.check_challenge_timeout()
+                    
                     # Detect intruders if watchdog is enabled
                     if self.watchdog_enabled:
                         if self.use_yolo:
@@ -1200,13 +1378,28 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                         # Only add status text if displaying
                         if display_window:
                             # Add status text (simplified)
-                            status_text = f"FPS: {fps} | Watchdog: ON | Tracking: {'ON' if self.is_tracking else 'OFF'} | Patrol: {'ON' if self.patrol_mode else 'OFF'}"
+                            status_text = f"FPS: {fps} | Watchdog: ON | Voice Challenge: {'ON' if self.voice_challenge_enabled else 'OFF'} | Tracking: {'ON' if self.is_tracking else 'OFF'} | Patrol: {'ON' if self.patrol_mode else 'OFF'}"
                             cv2.putText(display_frame, status_text, (10, 30), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                             
+                            # Add challenge status if active
+                            if self.voice_challenge_enabled:
+                                if self.challenge_active:
+                                    challenge_text = "Challenge: ACTIVE"
+                                    color = (0, 255, 255)  # Yellow
+                                elif self.challenge_passed:
+                                    challenge_text = "Challenge: PASSED"
+                                    color = (0, 255, 0)  # Green
+                                else:
+                                    challenge_text = "Challenge: WAITING"
+                                    color = (255, 255, 255)  # White
+                                
+                                cv2.putText(display_frame, challenge_text, (10, 60), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            
                             if self.use_yolo and self.person_detected:
                                 person_text = f"Person: Count={self.person_count}, Behavior={self.intruder_behavior}, Dist={self.intruder_distance}"
-                                cv2.putText(display_frame, person_text, (10, 60), 
+                                cv2.putText(display_frame, person_text, (10, 90), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                             
                             # Show compact intruder info
@@ -1216,7 +1409,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                                 else:
                                     desc_text = self.intruder_description
                                 
-                                cv2.putText(display_frame, f"Description: {desc_text}", (10, 90), 
+                                cv2.putText(display_frame, f"Description: {desc_text}", (10, 120), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                             
                             # Show compact warning message
@@ -1226,7 +1419,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                                 else:
                                     warning_text = self.generated_warning
                                 
-                                cv2.putText(display_frame, f"Warning: {warning_text}", (10, 120), 
+                                cv2.putText(display_frame, f"Warning: {warning_text}", (10, 150), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                     else:
                         if display_window:
@@ -1236,7 +1429,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                     
                     # Add help text at the bottom if displaying
                     if display_window:
-                        help_text = "Controls: [e]nable/[d]isable, [a]lerts, [t]rack, [p]atrol, [r]eset, [m]iddle, [j]ump, [h]andshake, [q]uit"
+                        help_text = "Controls: [e]nable/[d]isable, [a]lerts, [t]rack, [v]oice challenge, [p]atrol, [r]eset, [m]iddle, [j]ump, [h]andshake, [q]uit"
                         cv2.putText(display_frame, help_text, (10, display_frame.shape[0] - 20), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
@@ -1256,6 +1449,8 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
                             self.toggle_alerts(not self.alerts_enabled)
                         elif key == ord('t'):
                             self.toggle_tracking(not self.tracking_enabled)
+                        elif key == ord('v'):
+                            self.toggle_voice_challenge(not self.voice_challenge_enabled)
                         elif key == ord('p'):
                             self.toggle_patrol_mode(not self.patrol_mode)
                         elif key == ord('r'):
@@ -1315,15 +1510,8 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             video_thread.daemon = True
             video_thread.start()
             
-            # Start with a greeting message
-            asyncio.run(self.send_command("speak:Enhanced security watchdog with intruder tracking initialized and ready!"))
-            
-            # Announce special features
-            if self.ai_enabled:
-                asyncio.run(self.send_command("speak:Claude AI integration active for personalized warnings."))
-            
-            if self.tracking_enabled:
-                asyncio.run(self.send_command("speak:Intruder tracking system online."))
+            # Start with a minimal greeting message (no verbose announcements)
+            asyncio.run(self.send_command("speak:Security system activated."))
             
             # Start frame processing
             print("\nStarting watchdog monitor...")
@@ -1331,6 +1519,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
             print("Press 'd' to disable watchdog")
             print("Press 'a' to toggle alerts")
             print("Press 't' to toggle tracking")
+            print("Press 'v' to toggle voice challenge")
             print("Press 'p' to toggle patrol mode")
             print("Press 'r' to reset position (InitPos)")
             print("Press 'm' to go to middle position (MiddlePos)")
@@ -1356,7 +1545,7 @@ Do NOT use any placeholder expressions like [clothing]. Replace such placeholder
 def main():
     load_dotenv()  
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Enhanced Robot Watchdog with Intruder Tracking")
+    parser = argparse.ArgumentParser(description="Enhanced Robot Watchdog with Voice Challenge")
     parser.add_argument("--ip", type=str, default=None,
                         help="Robot IP address (default: from ROBOT_IP_ADDRESS env var)")
     parser.add_argument("--enable", action="store_true", 
@@ -1365,6 +1554,8 @@ def main():
                         help="Enable tracking on startup")
     parser.add_argument("--patrol", action="store_true",
                         help="Enable patrol mode on startup")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Disable voice challenge feature")
     parser.add_argument("--claude-key", type=str, default=None,
                         help="Claude API key for vision analysis (default: from CLAUDE_API_KEY env var)")
     parser.add_argument("--no-yolo", action="store_true",
@@ -1409,6 +1600,10 @@ def main():
     # Disable YOLO if requested
     if args.no_yolo:
         watchdog.use_yolo = False
+    
+    # Disable voice challenge if requested
+    if args.no_voice:
+        watchdog.voice_challenge_enabled = False
     
     # Enable watchdog if requested
     if args.enable:
