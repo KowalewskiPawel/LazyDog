@@ -165,36 +165,70 @@ class RobotConnection:
             self.command_queue.put(command)
         return True
     
-    def send_command_sync(self, command, timeout=5):
-        """Send a command and wait for the response (synchronous)"""
-        if not self._command_loop:
-            logger.error("Command processor not initialized")
-            return None
-            
-        # Create an event to signal when the response is ready
-        response_event = threading.Event()
-        response_data = [None]  # Use a list to store the response (to allow modification in the callback)
+    async def send_command(self, command):
+        """Send command to robot via WebSocket"""
+        tries = 3  # Number of connection retries
         
-        # Define the callback function
-        def callback(response):
-            response_data[0] = response
-            response_event.set()
+        for attempt in range(tries):
+            try:
+                if self.websocket is None:
+                    # Check if the connect method is 'connect' or 'connect_websocket'
+                    if hasattr(self, 'connect'):
+                        await self.connect()  # Use your existing connect method
+                    else:
+                        # If neither method exists, implement basic connection here
+                        self.websocket = await websockets.connect(self.ws_url)
+                        await self.websocket.send("admin:123456")
+                        response = await self.websocket.recv()
+                        print(f"Connected to robot! Response: {response}")
+                    
+                    if self.websocket is None:
+                        time.sleep(1)
+                        continue
+                
+                # Ensure command has correct format
+                if command.startswith("speak:") and " " in command and command[6] != " ":
+                    # Fix speak command format - some robots require no space after colon
+                    command = command.replace("speak: ", "speak:")
+                
+                # Send command
+                await self.websocket.send(command)
+                print(f"Sent command: {command}")
+                
+                # Wait for response with timeout to prevent hanging
+                response = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+                return response
+                
+            except asyncio.TimeoutError:
+                print(f"Command timed out: {command}")
+                self.websocket = None
+                
+            except Exception as e:
+                print(f"Command error (attempt {attempt + 1}/{tries}): {e}")
+                self.websocket = None
+                
+                if attempt < tries - 1:
+                    await asyncio.sleep(1)  # Wait before retry
         
-        # Queue the command with the callback
-        self.queue_command(command, callback)
+        return None
         
-        # Wait for the response or timeout
-        if response_event.wait(timeout):
-            return response_data[0]
-        else:
-            logger.error(f"Command timed out: {command}")
-            return None
-    
     # Public API methods
     def speak(self, text):
-        """Send a speak command to the robot"""
-        return self.queue_command(f"speak:{text}")
-    
+        """Queue a speak command with correct format"""
+        # Format should be: speak:Text with no space after colon
+        command = f"speak:{text}"
+        async def send_speak():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                await self.send_command(command)
+            finally:
+                loop.close()
+        
+        # Run in a separate thread to avoid blocking
+        threading.Thread(target=lambda: asyncio.run(send_speak()), daemon=True).start()
+        return True
+
     def light(self, color):
         """Control robot lights"""
         return self.queue_command(f"light {color}")
@@ -213,17 +247,15 @@ class RobotConnection:
         self.queue_command("TS")  # Stop left/right
         return True
     
-    def bark(self, duration=0.2):
-        """Make the robot bark once"""
-        self.queue_command("buzzer 1")
-        
-        # Schedule turning the buzzer off after the duration
-        def delayed_off():
-            time.sleep(duration)
-            self.queue_command("buzzer 0")
-        
-        threading.Thread(target=delayed_off, daemon=True).start()
-        return True
+    def bark(self):
+        """Make the robot bark"""
+        async def send_bark():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                await self.send_command("bark")
+            finally:
+                loop.close()
     
     def bark_sequence(self, intensity="normal"):
         """Execute a bark sequence with a specific pattern"""
