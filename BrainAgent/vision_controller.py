@@ -33,6 +33,11 @@ class DogBrain:
         self.last_frame_time = 0
         self.frame_capture_success = False
         
+        # Variables for the modified voice input system
+        self.command_mode = False  # Will be set based on keyboard availability
+        self.start_listening = False  # Flag for command-based listening
+        self.continuous_mode = False  # Will be set if neither keyboard nor command input is available
+        
         # Posture detection variables
         self.posture_model = None
         self.keypoints_history = deque(maxlen=50)  # Store recent posture keypoints
@@ -48,6 +53,11 @@ class DogBrain:
         self.last_posture_warning = 0
         self.posture_warning_cooldown = 120  # 2 minutes between warnings
         self.focus_mode_active = False
+        
+        self.currently_speaking = False
+        self.current_action_task = None
+        self.interrupt_event = asyncio.Event()
+        self.autonomous_mode = False 
         
         # Claude client initialization
         self.claude_api_key = claude_api_key
@@ -241,6 +251,24 @@ class DogBrain:
             
     async def process_voice_command(self, text):
         """Process voice commands directly"""
+        
+        # Set the interrupt flag to stop any current actions
+        self.interrupt_event.set()
+        
+        # If there's a current action running, cancel it
+        if self.current_action_task and not self.current_action_task.done():
+            self.current_action_task.cancel()
+            try:
+                await self.current_action_task
+            except asyncio.CancelledError:
+                print("Previous action cancelled due to new voice input")
+                # Stop any movement or speaking immediately
+                await self.send_command("DS")  # Stop forward/backward
+                await self.send_command("TS")  # Stop turning
+        
+        # Reset the interrupt flag
+        self.interrupt_event.clear()
+        
         text = text.lower().strip()
         print(f"🎯 Processing: {text}")
         
@@ -258,6 +286,14 @@ class DogBrain:
             "focus": ["focus", "concentrate", "work mode", "no distractions"],
             "posture": ["posture", "straight", "back", "slouch", "sit up"]
         }
+        
+        
+         # Special case for stop command
+        if any(word in text for word in commands["stop"]):
+            await self.send_command("DS")  # Stop forward/backward
+            await self.send_command("TS")  # Stop turning
+            await self.send_command("speak:Stopping!")
+            return True
         
         # Check for movement commands
         for command, triggers in commands.items():
@@ -286,106 +322,438 @@ class DogBrain:
                     else:
                         await self.send_command("speak:Focus mode deactivated. Feel free to relax.")
                     return True
-                await self.execute_command(command)
+                 # Execute the command in a new task so it can be interrupted
+                self.current_action_task = asyncio.create_task(self.execute_command(command))
                 return True
         
         # If not a command, generate a short response
+        self.currently_speaking = True
         response = await self.generate_response(text)
         await self.send_command(f"speak:{response}")
+        self.currently_speaking = False
         return True
 
     async def execute_command(self, command):
-        """Execute commands with proper timing and repetition"""
+        """Execute commands with proper timing and interruption support"""
         try:
             if command == "forward":
                 for _ in range(3):
+                    if self.interrupt_event.is_set():
+                        return
                     await self.send_command(command)
-                await asyncio.sleep(10.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 10.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("DS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("DS")
                 
             elif command == "backward":
                 for _ in range(3):
+                    if self.interrupt_event.is_set():
+                        return
                     await self.send_command(command)
-                await asyncio.sleep(8.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 8.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("DS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("DS")
                 
             elif command == "left":
                 for _ in range(2):
+                    if self.interrupt_event.is_set():
+                        return
                     await self.send_command(command)
-                await asyncio.sleep(5.5)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 5.5:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("TS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("TS")
                 
             elif command == "right":
                 for _ in range(2):
+                    if self.interrupt_event.is_set():
+                        return
                     await self.send_command(command)
-                await asyncio.sleep(5.5)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 5.5:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("TS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("TS")
                 
             elif command == "little_left":
+                if self.interrupt_event.is_set():
+                    return
                 await self.send_command("left")
-                await asyncio.sleep(2.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("TS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("TS")
                 
             elif command == "little_right":
+                if self.interrupt_event.is_set():
+                    return
                 await self.send_command("right")
-                await asyncio.sleep(2.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("TS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("TS")
                 
             elif command == "tiny_forward":
+                if self.interrupt_event.is_set():
+                    return
                 await self.send_command("forward")
-                await asyncio.sleep(3.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 3.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("DS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("DS")
                 
             elif command == "tiny_backward":
+                if self.interrupt_event.is_set():
+                    return
                 await self.send_command("backward")
-                await asyncio.sleep(3.0)
+                
+                # Loop that can be interrupted
+                start_time = time.time()
+                while time.time() - start_time < 3.0:
+                    if self.interrupt_event.is_set():
+                        await self.send_command("DS")
+                        return
+                    await asyncio.sleep(0.1)
+                
                 await self.send_command("DS")
                 
             elif command in ["jump", "handshake", "bark"]:
                 for _ in range(2):
+                    if self.interrupt_event.is_set():
+                        return
                     await self.send_command(command)
-                    await asyncio.sleep(10.5)
+                    
+                    # Loop that can be interrupted
+                    start_time = time.time()
+                    while time.time() - start_time < 10.5:
+                        if self.interrupt_event.is_set():
+                            return
+                        await asyncio.sleep(0.1)
                     
         except Exception as e:
             print(f"Command execution error: {e}")
             
     def listen_for_voice(self):
-        """Listen for voice input in a separate thread"""
-        print("Starting to listen... Speak to your robo-dog!")
+        """Listen for voice input when left shift key is pressed - macOS compatible"""
+        # Try to import pynput first (works better on macOS)
+        try:
+            from pynput import keyboard
+            
+            # Flag to track if shift is pressed
+            self.shift_pressed = False
+            self.recording = False
+            
+            def on_press(key):
+                # Check if key is shift
+                if key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
+                    if not self.shift_pressed and not self.recording:
+                        self.shift_pressed = True
+                        # Start a new thread to handle recording
+                        threading.Thread(target=self.record_audio_while_key_pressed).start()
+            
+            def on_release(key):
+                # Check if key is shift
+                if key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
+                    self.shift_pressed = False
+            
+            # Start keyboard listener
+            print("Dog brain ready! Press and hold LEFT SHIFT key to speak to your robo-dog!")
+            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            listener.start()
+            
+            # Keep the main thread running
+            while self.running:
+                time.sleep(0.1)
+            
+            # Stop listener when program exits
+            listener.stop()
+            return
+            
+        except ImportError:
+            # If pynput fails, try the regular keyboard library
+            try:
+                import keyboard
+                print("Using keyboard library. Press and hold LEFT SHIFT to speak.")
+                
+                while self.running:
+                    try:
+                        # Wait for shift key to be pressed (try multiple codes for macOS compatibility)
+                        shift_codes = [160, 'shift', 'left shift']
+                        shift_pressed = False
+                        
+                        for code in shift_codes:
+                            try:
+                                if keyboard.is_pressed(code):
+                                    shift_pressed = True
+                                    break
+                            except:
+                                continue
+                        
+                        if shift_pressed:
+                            print("\n🎤 Listening... Speak now!")
+                            time.sleep(0.2)  # Small delay to avoid key bounce
+                            
+                            with sr.Microphone() as source:
+                                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                                
+                                print("🔴 Recording... Release shift key when done.")
+                                
+                                # Start recording with a reasonably short phrase limit
+                                audio = self.recognizer.listen(source, phrase_time_limit=10)
+                                
+                                print("Processing speech...")
+                                
+                                # Process the audio
+                                try:
+                                    text = self.recognizer.recognize_google(audio)
+                                    if text:  # Only process non-empty results
+                                        print(f"🎤 Transcribed: {text}")
+                                        self.last_voice_input = text
+                                        self.voice_queue.put(text)
+                                        print("Sending to robot brain... wait for response.")
+                                except sr.UnknownValueError:
+                                    print("Couldn't understand audio")
+                                except sr.RequestError as e:
+                                    print(f"Speech recognition error: {e}")
+                            
+                            # Wait until key is released to avoid multiple triggers
+                            released = False
+                            while not released and self.running:
+                                released = True
+                                for code in shift_codes:
+                                    try:
+                                        if keyboard.is_pressed(code):
+                                            released = False
+                                            break
+                                    except:
+                                        continue
+                                time.sleep(0.1)
+                            
+                            # Additional cool-down to avoid double-triggers
+                            time.sleep(0.5)
+                        else:
+                            # Sleep when not checking key
+                            time.sleep(0.1)
+                            
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"Listening error: {e}")
+                        # Sleep on error to avoid CPU hogging
+                        time.sleep(0.5)
+                        continue
+                
+            except (ImportError, PermissionError, OSError) as e:
+                print(f"Keyboard control not available ({e}).")
+                print("Install pynput with: pip install pynput")
+                print("Falling back to continuous listening mode with voice trigger...")
+                return self._continuous_listen_fallback()
+    
+    def record_audio_while_key_pressed(self):
+        """Record audio while shift key is pressed using pynput"""
+        if self.recording:
+            return
+            
+        self.recording = True
+        print("\n🎤 Listening... Speak now!")
+        
+        try:
+            with sr.Microphone() as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                print("🔴 Recording... Release shift key when done.")
+                
+                # Start recording with a timeout
+                audio = self.recognizer.listen(source, phrase_time_limit=10)
+                
+                # Check if key is still pressed
+                if not self.shift_pressed:
+                    print("Processing speech...")
+                    try:
+                        text = self.recognizer.recognize_google(audio)
+                        if text:
+                            print(f"🎤 Transcribed: {text}")
+                            self.last_voice_input = text
+                            self.voice_queue.put(text)
+                            print("Sending to robot brain... wait for response.")
+                    except sr.UnknownValueError:
+                        print("Couldn't understand audio")
+                    except sr.RequestError as e:
+                        print(f"Speech recognition error: {e}")
+        except Exception as e:
+            print(f"Recording error: {e}")
+        
+        # Reset recording flag with a small delay
+        time.sleep(0.5)
+        self.recording = False
+
+    def _continuous_listen_fallback(self):
+        """Fallback to listening with voice activation and manual input"""
+        print("\n⚠️ Keyboard input not available. Using fallback modes:")
+        print("1. Say one of these to activate me: 'hey dog', 'dog listen', 'wake up'")
+        print("2. Type 'listen' in the terminal and press Enter")
+        
+        # Start a thread to handle console input
+        input_thread = threading.Thread(target=self._console_input_loop)
+        input_thread.daemon = True
+        input_thread.start()
+        
+        # Variables for voice activation
+        self.listen_mode = False
+        self.listen_start_time = 0
+        self.listen_timeout = 10  # seconds
+        activation_phrases = ["hey dog", "dog listen", "wake up", "listen now"]
+        deactivation_phrases = ["go to sleep", "stop listening"]
         
         while self.running:
             try:
                 with sr.Microphone() as source:
-                    # Only adjust for ambient noise occasionally
-                    if random.random() < 0.1:  # 10% chance to readjust
-                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    # Adjust for ambient noise occasionally
+                    if random.random() < 0.1:
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
                     
-                    # Listen without timeout for phrase start
-                    audio = self.recognizer.listen(source, 
-                                                phrase_time_limit=5,  # Max phrase length
-                                                timeout=None)  # No timeout for start
+                    # Short timeout to make it more responsive
+                    audio = self.recognizer.listen(source, phrase_time_limit=3, timeout=1)
                     
                     try:
-                        text = self.recognizer.recognize_google(audio)
-                        if text:  # Only process non-empty results
-                            print(f"\n🎤 Human said: {text}")
+                        text = self.recognizer.recognize_google(audio).lower()
+                        
+                        # Check for activation phrases
+                        is_activation = any(phrase in text for phrase in activation_phrases)
+                        is_deactivation = any(phrase in text for phrase in deactivation_phrases)
+                        
+                        # Activation phrase detected
+                        if is_activation and not self.listen_mode:
+                            self.listen_mode = True
+                            self.listen_start_time = time.time()
+                            print("\n🔊 LISTENING MODE ACTIVATED - Say your command")
+                            continue
+                            
+                        # Deactivation phrase detected
+                        if is_deactivation and self.listen_mode:
+                            self.listen_mode = False
+                            print("\n🔇 Listening mode deactivated")
+                            continue
+                        
+                        # Process command if in listening mode
+                        if self.listen_mode:
+                            # Reset timer
+                            self.listen_start_time = time.time()
+                            
+                            print(f"🎤 Heard: {text}")
                             self.last_voice_input = text
                             self.voice_queue.put(text)
+                        
+                        # Check if listening mode timed out
+                        current_time = time.time()
+                        if self.listen_mode and (current_time - self.listen_start_time > self.listen_timeout):
+                            self.listen_mode = False
+                            print("\n🔇 Listening mode timed out")
+                        
                     except sr.UnknownValueError:
                         # Silent fail for unrecognized speech
                         pass
                     except sr.RequestError as e:
-                        # Only print actual errors
                         print(f"Speech recognition error: {e}")
-                        
+                
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                # Only print non-timeout errors
+                # Filter out timeouts which are expected
                 if "timeout" not in str(e).lower():
                     print(f"Listening error: {e}")
-                continue
-
+                time.sleep(0.2)
+    
+    def _console_input_loop(self):
+        """Thread for handling console input"""
+        print("📝 Type 'listen' and press Enter to start listening for a command")
+        
+        while self.running:
+            try:
+                cmd = input()
+                if cmd.lower().strip() == "listen":
+                    print("🎤 Say your command now...")
+                    
+                    with sr.Microphone() as source:
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                        print("🔴 Recording... (10 second limit)")
+                        
+                        # Record with timeout
+                        audio = self.recognizer.listen(source, phrase_time_limit=10)
+                        
+                        print("Processing speech...")
+                        try:
+                            text = self.recognizer.recognize_google(audio)
+                            if text:
+                                print(f"🎤 Transcribed: {text}")
+                                self.last_voice_input = text
+                                self.voice_queue.put(text)
+                                print("Sending to robot brain... wait for response.")
+                        except sr.UnknownValueError:
+                            print("Couldn't understand audio")
+                        except sr.RequestError as e:
+                            print(f"Speech recognition error: {e}")
+                
+                elif cmd.lower().strip() == "exit" or cmd.lower().strip() == "quit":
+                    print("Exiting...")
+                    self.running = False
+                    break
+                    
+                elif cmd.lower().strip() == "help":
+                    print("\nCommands:")
+                    print("  listen - Start listening for voice command")
+                    print("  exit/quit - Exit the program")
+                    print("  help - Show this help message")
+                    
+                else:
+                    print("Unknown command. Type 'help' for available commands.")
+                    
+            except Exception as e:
+                print(f"Input error: {e}")
+                time.sleep(0.5)
+                
     def capture_video(self):
         """Capture video frames in a separate thread"""
         print(f"Starting dog vision... Connecting to {self.video_url}")
@@ -437,6 +805,43 @@ class DogBrain:
             print("Maximum video capture retries reached. Vision may not be available.")
             self.frame_capture_success = False
 
+    def _continuous_listen_fallback(self):
+        """Fallback to continuous listening mode (original behavior)"""
+        print("Starting continuous listening mode... Speak any time.")
+        
+        while self.running:
+            try:
+                with sr.Microphone() as source:
+                    # Only adjust for ambient noise occasionally
+                    if random.random() < 0.1:  # 10% chance to readjust
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    
+                    # Listen without timeout for phrase start
+                    audio = self.recognizer.listen(source, 
+                                                phrase_time_limit=5,  # Max phrase length
+                                                timeout=None)  # No timeout for start
+                    
+                    try:
+                        text = self.recognizer.recognize_google(audio)
+                        if text:  # Only process non-empty results
+                            print(f"\n🎤 Human said: {text}")
+                            self.last_voice_input = text
+                            self.voice_queue.put(text)
+                    except sr.UnknownValueError:
+                        # Silent fail for unrecognized speech
+                        pass
+                    except sr.RequestError as e:
+                        # Only print actual errors
+                        print(f"Speech recognition error: {e}")
+                        
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                # Only print non-timeout errors
+                if "timeout" not in str(e).lower():
+                    print(f"Listening error: {e}")
+                continue
+
     async def connect_websocket(self):
         """Connect to robot's body"""
         try:
@@ -450,19 +855,37 @@ class DogBrain:
             return False
 
     async def send_command(self, command):
-        """Send command to robot's body"""
+        """Send command to robot's body, cancellable on interruption"""
+        # If it's a speak command, mark as speaking
+        if command.startswith("speak:"):
+            self.currently_speaking = True
+        
         tries = 3  # Number of connection retries
         for attempt in range(tries):
             try:
+                # Check if we should interrupt
+                if self.interrupt_event.is_set():
+                    self.currently_speaking = False
+                    return None
+                    
                 if self.websocket is None:
                     await self.connect_websocket()
                 await self.websocket.send(command)
-                return await self.websocket.recv()
+                response = await self.websocket.recv()
+                
+                # If command completed successfully, mark as not speaking
+                if command.startswith("speak:"):
+                    self.currently_speaking = False
+                    
+                return response
             except Exception as e:
                 print(f"Command error (attempt {attempt + 1}/{tries}): {e}")
                 self.websocket = None
                 if attempt < tries - 1:
                     await asyncio.sleep(1)  # Wait before retry
+        
+        # If we get here, command failed
+        self.currently_speaking = False
         return None
 
     async def analyze_frame(self, frame):
@@ -735,6 +1158,9 @@ class DogBrain:
             
     async def run(self):
         """Main dog brain loop"""
+        # Initialize thread variables before try/except to avoid UnboundLocalError
+        video_thread = None
+        voice_thread = None
         try:
             video_thread = threading.Thread(target=self.capture_video)
             voice_thread = threading.Thread(target=self.listen_for_voice)
@@ -742,7 +1168,6 @@ class DogBrain:
             voice_thread.start()
             
             print("Dog brain activated! Press Ctrl+C to stop.")
-            print("Speak to your robo-dog!")
 
             # Wait for some initial frames to be captured
             wait_start = time.time()
@@ -760,16 +1185,16 @@ class DogBrain:
             print("🐕 Waking up and stretching!")
             await self.send_command("speak:Hello! I'm awake!")
             
-            if frame_received:
-                frame = self.frame_queue.get()
-                perception = await self.analyze_frame(frame)
-                if perception:
-                    await self.dog_reaction(perception)
-            else:
-                print("No video frames received during startup. Continuing without vision.")
+            # if frame_received:
+            #     frame = self.frame_queue.get()
+            #     perception = await self.analyze_frame(frame)
+            #     if perception:
+            #         await self.dog_reaction(perception)
+            # else:
+            #     print("No video frames received during startup. Continuing without vision.")
                             
             last_visual_processing_time = 0
-            visual_process_interval = 10  # Process visual input every 10 seconds
+            visual_process_interval = 60  # Process visual input every 10 seconds
             last_posture_check_time = 0
 
             while self.running:
@@ -781,36 +1206,43 @@ class DogBrain:
                     await self.process_voice_command(command)
                     await asyncio.sleep(0.1)
                 
-                # Then process visual input every 10 seconds
-                if current_time - last_visual_processing_time >= visual_process_interval:
-                    if not self.frame_queue.empty():
-                        print(f"Processing visual input (interval: {visual_process_interval}s)")
-                        frame = self.frame_queue.get()
-                        perception = await self.analyze_frame(frame)
-                        if perception:
-                            await self.dog_reaction(perception)
-                        last_visual_processing_time = current_time
-                
-                # Check posture at regular intervals
-                if self.posture_model and current_time - last_posture_check_time >= self.posture_check_interval:
-                    if not self.frame_queue.empty():
-                        try:
-                            # Use a copy of the frame to avoid removing it from the queue
-                            frame_copy = self.frame_queue.queue[0].copy()
-                            print("Checking posture...")
-                            await self.detect_posture(frame_copy)
-                            last_posture_check_time = current_time
-                        except Exception as e:
-                            print(f"Error during posture check: {e}")
+                 # Only perform autonomous actions if autonomous_mode is True
+                if self.autonomous_mode:
+                    # Process visual input (only if not currently responding to human)
+                    if (not self.currently_speaking and 
+                        current_time - last_visual_processing_time >= visual_process_interval):
+                        if not self.frame_queue.empty():
+                            print(f"Processing visual input (interval: {visual_process_interval}s)")
+                            frame = self.frame_queue.get()
+                            perception = await self.analyze_frame(frame)
+                            if perception:
+                                await self.dog_reaction(perception)
+                            last_visual_processing_time = current_time
                     
+                    # Check posture at regular intervals (only if not currently responding)
+                    if (self.posture_model and not self.currently_speaking and 
+                        current_time - last_posture_check_time >= self.posture_check_interval):
+                        if not self.frame_queue.empty():
+                            try:
+                                # Use a copy of the frame to avoid removing it from the queue
+                                frame_copy = self.frame_queue.queue[0].copy()
+                                print("Checking posture...")
+                                await self.detect_posture(frame_copy)
+                                last_posture_check_time = current_time
+                            except Exception as e:
+                                print(f"Error during posture check: {e}")
+                
                 await asyncio.sleep(0.1)
 
         except KeyboardInterrupt:
-            print("\nPutting the dog to sleep...")
+            print("\nShutting down...")
         finally:
             self.running = False
-            video_thread.join()
-            voice_thread.join()
+            # Only join threads if they were successfully created and started
+            if video_thread is not None:
+                video_thread.join()
+            if voice_thread is not None:
+                voice_thread.join()
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
