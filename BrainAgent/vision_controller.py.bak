@@ -10,10 +10,6 @@ import time
 import speech_recognition as sr
 import os
 import anthropic
-import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
-from collections import deque
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class DogBrain:
@@ -33,22 +29,6 @@ class DogBrain:
         self.last_frame_time = 0
         self.frame_capture_success = False
         
-        # Posture detection variables
-        self.posture_model = None
-        self.keypoints_history = deque(maxlen=50)  # Store recent posture keypoints
-        self.slouch_threshold = 0.25  # Configurable threshold for slouching
-        self.last_posture_check_time = 0
-        self.posture_check_interval = 30  # Check posture every 30 seconds
-        self.slouch_duration = 0  # How long the user has been slouching
-        self.slouch_warning_levels = {
-            "mild": 60,     # 1 minute of slouching
-            "moderate": 180, # 3 minutes of slouching
-            "severe": 300    # 5 minutes of slouching
-        }
-        self.last_posture_warning = 0
-        self.posture_warning_cooldown = 120  # 2 minutes between warnings
-        self.focus_mode_active = False
-        
         # Claude client initialization
         self.claude_api_key = claude_api_key
         self.client = anthropic.Anthropic(api_key=claude_api_key)
@@ -60,23 +40,7 @@ class DogBrain:
         print(f"Video URL set to: {self.video_url}")
         print(f"Using Claude model: {self.claude_model}")
         print("Dog brain ready to explore!")
-        
-        # Load posture detection model
-        self._load_posture_model()
 
-    def _load_posture_model(self):
-        """Load the MoveNet posture detection model"""
-        try:
-            # Load MoveNet from TensorFlow Hub
-            model_name = "movenet_singlepose_thunder"
-            model_url = f"https://tfhub.dev/google/{model_name}/4"
-            print(f"Loading posture detection model: {model_name}")
-            self.posture_model = hub.load(model_url)
-            print("Posture detection model loaded successfully")
-        except Exception as e:
-            print(f"Failed to load posture detection model: {e}")
-            self.posture_model = None
-    
     async def send_command_multiple(self, command, times=3, delay=0.1):
         """Send a command multiple times with delay to ensure it's received"""
         responses = []
@@ -101,128 +65,6 @@ class DogBrain:
         # Small pause after movement
         await asyncio.sleep(0.2)
 
-    async def detect_posture(self, frame):
-        """Detect body posture using MoveNet and analyze for slouching"""
-        if self.posture_model is None:
-            return False
-            
-        try:
-            # Resize image for model
-            img = tf.image.resize_with_pad(np.expand_dims(frame, axis=0), 256, 256)
-            
-            # Run model inference
-            results = self.posture_model(img)
-            keypoints = results['output_0'].numpy()
-            
-            # Extract relevant keypoints (0=nose, 5=left shoulder, 6=right shoulder, 11=left hip, 12=right hip)
-            keypoints_with_scores = keypoints[0, 0, :, :3]
-            
-            # Store current keypoints with timestamp
-            self.keypoints_history.append({
-                'keypoints': keypoints_with_scores,
-                'timestamp': time.time()
-            })
-            
-            # Analyze posture for slouching
-            is_slouching = self._analyze_slouching(keypoints_with_scores)
-            
-            # Update slouch duration
-            current_time = time.time()
-            if is_slouching:
-                if self.slouch_duration == 0:
-                    # Start of a slouch period
-                    self.slouch_duration = current_time
-                # Otherwise slouch_duration already contains the start time
-            else:
-                # Reset slouch duration if not slouching
-                self.slouch_duration = 0
-                
-            # Check if we need to send a warning
-            if self.slouch_duration > 0:
-                slouch_time = current_time - self.slouch_duration
-                
-                # Check if we've been slouching longer than our warning thresholds
-                # and if we're past the cooldown period for warnings
-                if slouch_time >= self.slouch_warning_levels["severe"] and current_time - self.last_posture_warning >= self.posture_warning_cooldown:
-                    await self.send_posture_alert("severe")
-                    self.last_posture_warning = current_time
-                elif slouch_time >= self.slouch_warning_levels["moderate"] and current_time - self.last_posture_warning >= self.posture_warning_cooldown:
-                    await self.send_posture_alert("moderate")
-                    self.last_posture_warning = current_time
-                elif slouch_time >= self.slouch_warning_levels["mild"] and current_time - self.last_posture_warning >= self.posture_warning_cooldown:
-                    await self.send_posture_alert("mild")
-                    self.last_posture_warning = current_time
-                    
-            return is_slouching
-            
-        except Exception as e:
-            print(f"Posture detection error: {e}")
-            return False
-            
-    def _analyze_slouching(self, keypoints):
-        """Analyze keypoints to determine if the user is slouching"""
-        # Extract relevant keypoints
-        nose = keypoints[0, :2]
-        left_shoulder = keypoints[5, :2]
-        right_shoulder = keypoints[6, :2]
-        left_hip = keypoints[11, :2]
-        right_hip = keypoints[12, :2]
-        
-        # Confidence scores
-        nose_score = keypoints[0, 2]
-        left_shoulder_score = keypoints[5, 2]
-        right_shoulder_score = keypoints[6, 2]
-        left_hip_score = keypoints[11, 2]
-        right_hip_score = keypoints[12, 2]
-        
-        # Only proceed if we have reasonable confidence in the keypoints
-        min_confidence = 0.3
-        if (nose_score < min_confidence or 
-            left_shoulder_score < min_confidence or 
-            right_shoulder_score < min_confidence or
-            left_hip_score < min_confidence or
-            right_hip_score < min_confidence):
-            return False
-            
-        # Calculate midpoints
-        shoulder_midpoint = [(left_shoulder[0] + right_shoulder[0])/2, (left_shoulder[1] + right_shoulder[1])/2]
-        hip_midpoint = [(left_hip[0] + right_hip[0])/2, (left_hip[1] + right_hip[1])/2]
-        
-        # Calculate vertical alignment (how much the shoulders are in front of the hips)
-        # In image coordinates, y increases downward, so we need to check if shoulders are lower than expected
-        
-        # Calculate expected posture line from hip to nose
-        expected_shoulder_y = hip_midpoint[1] - (hip_midpoint[1] - nose[1]) * 0.4  # Shoulders are about 40% of the way from hips to nose
-        
-        # If shoulders are lower (y is higher) than expected, it indicates slouching
-        slouch_amount = (shoulder_midpoint[1] - expected_shoulder_y) / (hip_midpoint[1] - nose[1])
-        
-        # Debug info
-        if random.random() < 0.05:  # Only print occasionally to avoid spam
-            print(f"Slouch analysis - amount: {slouch_amount:.2f}, threshold: {self.slouch_threshold}")
-        
-        return slouch_amount > self.slouch_threshold
-        
-    async def send_posture_alert(self, severity="mild"):
-        """Send an alert about poor posture based on severity"""
-        alerts = {
-            "mild": "I notice you're starting to slouch a bit. Maybe take a quick stretch?",
-            "moderate": "You've been slouching for a while now. Time to sit up straight!",
-            "severe": "Your posture doesn't look good! Please fix your posture and consider taking a short break to stretch."
-        }
-        
-        alert = alerts.get(severity, alerts["mild"])
-        print(f"🐕 Posture alert ({severity}): {alert}")
-        await self.send_command(f"speak:{alert}")
-        
-        # Add a physical reaction for emphasis
-        if severity == "severe":
-            await self.bark_sequence("alert")
-        elif severity == "moderate":
-            await self.bark_sequence("normal")
-        else:
-            await self.send_command_multiple("bark", times=1)
-            
     async def bark_sequence(self, intensity="normal"):
         """Execute a bark with variable patterns"""
         patterns = {
@@ -254,9 +96,7 @@ class DogBrain:
             "handshake": ["shake", "paw", "hand"],
             "bark": ["bark", "woof"],
             "steady": ["steady", "balance", "stabilize"],
-            "stop": ["stop", "halt", "freeze"],
-            "focus": ["focus", "concentrate", "work mode", "no distractions"],
-            "posture": ["posture", "straight", "back", "slouch", "sit up"]
+            "stop": ["stop", "halt", "freeze"]
         }
         
         # Check for movement commands
@@ -268,23 +108,6 @@ class DogBrain:
                     return True
                 if command == "steady":
                     await self.send_command("steady")
-                    return True
-                if command == "posture":
-                    await self.send_command("speak:Let me check your posture")
-                    if not self.frame_queue.empty():
-                        frame = self.frame_queue.queue[0].copy()
-                        is_slouching = await self.detect_posture(frame)
-                        if is_slouching:
-                            await self.send_posture_alert("mild")
-                        else:
-                            await self.send_command("speak:Your posture looks good! Keep it up!")
-                    return True
-                if command == "focus":
-                    self.focus_mode_active = not self.focus_mode_active
-                    if self.focus_mode_active:
-                        await self.send_command("speak:Focus mode activated. I'll help you stay on task and check your posture regularly.")
-                    else:
-                        await self.send_command("speak:Focus mode deactivated. Feel free to relax.")
                     return True
                 await self.execute_command(command)
                 return True
@@ -480,14 +303,14 @@ class DogBrain:
                 message = self.client.messages.create(
                     model=self.claude_model,
                     max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment. Respond in under 10 words!",
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
                     messages=[
                         {
                             "role": "user",
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see! Respond in under 10 words!"
+                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
                                 },
                                 {
                                     "type": "image",
@@ -514,14 +337,14 @@ class DogBrain:
                 message = self.client.messages.create(
                     model="claude-3-opus-20240229",
                     max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment. Respond in under 10 words!",
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world with curiosity and enthusiasm! You're playful, energetic, and always eager to interact with your environment.",
                     messages=[
                         {
                             "role": "user",
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see! Respond in under 10 words!"
+                                    "text": "Looking at this image, respond with either:\n1. A movement command: forward, tiny_forward, backward, tiny_backward, left, little_left, right, little_right, bark, jump, or handshake\n2. An observation starting with \"speak:\"\n\nBe active and engaging! Mix different movements and share your excitement about what you see!"
                                 },
                                 {
                                     "type": "image",
@@ -599,7 +422,7 @@ class DogBrain:
                 message = self.client.messages.create(
                     model=self.claude_model,
                     max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality! Respond in under 10 words!",
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
                     messages=[
                         {
                             "role": "user",
@@ -615,7 +438,7 @@ class DogBrain:
                 message = self.client.messages.create(
                     model="claude-3-opus-20240229",
                     max_tokens=1024,
-                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality! Respond in under 10 words!",
+                    system="You are a cheerful and adventurous robo-dog who loves exploring the world! Be concise, witty, and maintain your cheerful personality!",
                     messages=[
                         {
                             "role": "user",
@@ -748,7 +571,7 @@ class DogBrain:
             wait_start = time.time()
             frame_received = False
             
-            while time.time() - wait_start < 40 and not frame_received:
+            while time.time() - wait_start < 10 and not frame_received:
                 if not self.frame_queue.empty():
                     frame_received = True
                     print("First video frame received!")
@@ -770,7 +593,6 @@ class DogBrain:
                             
             last_visual_processing_time = 0
             visual_process_interval = 10  # Process visual input every 10 seconds
-            last_posture_check_time = 0
 
             while self.running:
                 # Process voice commands first
@@ -791,18 +613,6 @@ class DogBrain:
                             await self.dog_reaction(perception)
                         last_visual_processing_time = current_time
                 
-                # Check posture at regular intervals
-                if self.posture_model and current_time - last_posture_check_time >= self.posture_check_interval:
-                    if not self.frame_queue.empty():
-                        try:
-                            # Use a copy of the frame to avoid removing it from the queue
-                            frame_copy = self.frame_queue.queue[0].copy()
-                            print("Checking posture...")
-                            await self.detect_posture(frame_copy)
-                            last_posture_check_time = current_time
-                        except Exception as e:
-                            print(f"Error during posture check: {e}")
-                    
                 await asyncio.sleep(0.1)
 
         except KeyboardInterrupt:
