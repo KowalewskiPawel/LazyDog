@@ -519,6 +519,9 @@ Be concise, witty, and maintain your cheerful personality!"""
                 voice_thread.join()
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()  
+
     ROBOT_IP = os.getenv('ROBOT_IP_ADDRESS')  # Your robot's IP
     GROK_API_KEY = os.getenv('GROK_API_KEY') # Your Grok API key
     brain = DogBrain(ROBOT_IP, GROK_API_KEY)
