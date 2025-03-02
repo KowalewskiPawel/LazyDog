@@ -77,21 +77,21 @@ class DogBrain:
             await asyncio.sleep(pause)
             
     async def process_voice_command(self, text):
-        """Process voice commands in Polish"""
+        """Process voice commands in Turkish"""
         text = text.lower().strip()
-        print(f"🎯 Przetwarzam: {text}")
+        print(f"🎯 İşleniyor: {text}")
         
-        # Polish command mapping
+        # Turkish command mapping
         commands = {
-            "forward": ["naprzód", "idź", "ruszaj", "do przodu"],
-            "backward": ["cofnij", "wstecz", "do tyłu"],
-            "left": ["lewo", "w lewo", "skręć w lewo"],
-            "right": ["prawo", "w prawo", "skręć w prawo"],
-            "jump": ["skacz", "skok", "podskocz"],
-            "handshake": ["łapa", "daj łapę", "przywitaj się"],
-            "bark": ["szczekaj", "głos", "daj głos"],
-            "steady": ["równowaga", "stabilnie", "spokojnie"],
-            "stop": ["stop", "stój", "zatrzymaj się", "halt"]
+            "forward": ["ileri", "yürü", "git", "düz git"],
+            "backward": ["geri", "geri git", "geriye"],
+            "left": ["sol", "sola", "sola dön"],
+            "right": ["sağ", "sağa", "sağa dön"],
+            "jump": ["zıpla", "atla", "hopla"],
+            "handshake": ["pati", "pati ver", "selamlaş"],
+            "bark": ["havla", "ses ver", "konuş"],
+            "steady": ["dengede dur", "sabit dur", "sakin"],
+            "stop": ["dur", "durdu", "bekle"]
         }
         
         # Check for movement commands
@@ -168,8 +168,8 @@ class DogBrain:
             print(f"Command execution error: {e}")
             
     def listen_for_voice(self):
-        """Listen for Polish voice input"""
-        print("Nasłuchuję... Powiedz coś do swojego robo-psa!")
+        """Listen for Turkish voice input"""
+        print("Dinliyorum... Robo-köpeğinize bir şey söyleyin!")
         
         while self.running:
             try:
@@ -182,21 +182,21 @@ class DogBrain:
                                                 timeout=None)
                     
                     try:
-                        text = self.recognizer.recognize_google(audio, language="pl-PL")
+                        text = self.recognizer.recognize_google(audio, language="tr-TR")
                         if text:
-                            print(f"\n🎤 Człowiek powiedział: {text}")
+                            print(f"\n🎤 İnsan dedi ki: {text}")
                             self.last_voice_input = text
                             self.voice_queue.put(text)
                     except sr.UnknownValueError:
                         pass
                     except sr.RequestError as e:
-                        print(f"Błąd rozpoznawania mowy: {e}")
+                        print(f"Ses tanıma hatası: {e}")
                         
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 if "timeout" not in str(e).lower():
-                    print(f"Błąd nasłuchiwania: {e}")
+                    print(f"Dinleme hatası: {e}")
                 continue
 
     def capture_video(self):
@@ -258,16 +258,16 @@ class DogBrain:
                 "messages": [
                     {
                         "role": "system",
-                        "content": """Jesteś wesołym i ciekawskim robo-psem, który uwielbia odkrywać świat z entuzjazmem! 
-Jesteś energiczny i zawsze chętny do interakcji ze swoim otoczeniem."""
+                        "content": """Sen dünyayı keşfetmeyi seven neşeli ve meraklı bir robo-köpeksin! 
+Enerjik ve çevrenle etkileşime girmeye her zaman heveslisin."""
                     },
                     {
                         "role": "user",
-                        "content": """Patrząc na ten obraz, odpowiedz jednym z:
-1. Komenda ruchu: naprzód, mały_krok, wstecz, mały_krok_tył, lewo, lekko_lewo, prawo, lekko_prawo, szczekaj, skacz, lub łapa
-2. Obserwacja zaczynająca się od "mówię:"
+                        "content": """Bu görüntüye bakarak şunlardan birini yanıtla:
+1. Hareket komutu: ileri, küçük_adım, geri, küçük_geri_adım, sol, hafif_sol, sağ, hafif_sağ, havla, zıpla, veya pati
+2. "söyle:" ile başlayan bir gözlem
 
-Bądź aktywny i zaangażowany! Mieszaj różne ruchy i dziel się swoim entuzjazmem z tego, co widzisz!""",
+Aktif ve ilgili ol! Farklı hareketleri karıştır ve gördüklerinden duyduğun heyecanı paylaş!""",
                         "image": image_base64
                     }
                 ],
@@ -480,7 +480,7 @@ Be concise, witty, and maintain your cheerful personality!"""
 
                 # Initial startup behavior
                 print("🐕 Waking up and stretching!")
-                await self.send_command("speak:Hello! I'm awake!")
+                await self.send_command("speak:Merhaba! Uyandım!")
                 frame = self.frame_queue.get()
                 perception = await self.analyze_frame(frame)
                 if perception:

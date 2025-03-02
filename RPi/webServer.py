@@ -30,13 +30,13 @@ voices = engine.getProperty('voices')
 for voice in voices:
     # Print available voices for debugging
     print(f"Found voice: {voice.name} ({voice.id})")
-    if 'polish' in voice.name.lower() or 'pl' in voice.id.lower():
-        print(f"Setting Polish voice: {voice.name}")
+    if 'turkish' in voice.name.lower() or 'tr' in voice.id.lower():
+        print(f"Setting Turkish voice: {voice.name}")
         engine.setProperty('voice', voice.id)
         break
 
-# Test Polish TTS
-engine.say("Dzień dobry")
+# Test Turkish TTS
+engine.say("Merhaba")
 engine.runAndWait()
 
 def speech_worker():
