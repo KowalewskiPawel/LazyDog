@@ -1,7 +1,7 @@
 {
-  "name": "browser-movenet",
+  "name": "enhanced-posture-detection",
   "version": "1.0.0",
-  "description": "Browser-based MoveNet pose detection for robot cameras",
+  "description": "Advanced posture detection with MoveNet",
   "main": "posture-cam.js",
   "scripts": {
     "start": "node posture-cam.js"

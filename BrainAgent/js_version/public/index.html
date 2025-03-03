@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>MoveNet Posture Camera</title>
+  <title>Posture Detection</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- TensorFlow.js -->
@@ -12,10 +12,11 @@
   
   <style>
     body {
-      font-family: Arial, sans-serif;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
       margin: 0;
       padding: 0;
       background-color: #f0f0f0;
+      color: #333;
     }
     .container {
       max-width: 1000px;
@@ -25,6 +26,9 @@
     .video-container {
       position: relative;
       margin-bottom: 20px;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
     }
     #videoElement {
       display: none;
@@ -33,8 +37,6 @@
       display: block;
       background-color: #333;
       max-width: 100%;
-      border-radius: 8px;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
     .controls {
       display: flex;
@@ -43,12 +45,14 @@
       flex-wrap: wrap;
     }
     button {
-      padding: 8px 16px;
+      padding: 10px 16px;
       background-color: #4285f4;
       color: white;
       border: none;
       border-radius: 4px;
       cursor: pointer;
+      font-weight: 500;
+      transition: background-color 0.2s;
     }
     button:hover {
       background-color: #3b78e7;
@@ -56,6 +60,18 @@
     button:disabled {
       background-color: #cccccc;
       cursor: not-allowed;
+    }
+    button.primary {
+      background-color: #34A853;
+    }
+    button.primary:hover {
+      background-color: #2E8B57;
+    }
+    button.warning {
+      background-color: #EA4335;
+    }
+    button.warning:hover {
+      background-color: #D32F2F;
     }
     .stats {
       background-color: rgba(0,0,0,0.7);
@@ -67,25 +83,39 @@
       left: 10px;
       font-size: 14px;
     }
+    .posture-status {
+      background-color: rgba(0,0,0,0.7);
+      color: white;
+      padding: 10px;
+      border-radius: 4px;
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-size: 14px;
+      max-width: 250px;
+    }
     .settings {
       margin-top: 20px;
       background-color: white;
-      padding: 15px;
+      padding: 20px;
       border-radius: 8px;
       box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .setting-row {
       display: flex;
       align-items: center;
-      margin-bottom: 10px;
+      margin-bottom: 15px;
     }
     select, input {
-      padding: 5px;
+      padding: 8px;
       margin-right: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
     }
     label {
       margin-right: 10px;
-      min-width: 150px;
+      min-width: 180px;
+      font-weight: 500;
     }
     .loading {
       position: fixed;
@@ -114,6 +144,78 @@
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }
     }
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 8px;
+    }
+    .status-good {
+      background-color: #34A853;
+    }
+    .status-warning {
+      background-color: #FBBC05;
+    }
+    .status-bad {
+      background-color: #EA4335;
+    }
+    .calibration-progress {
+      height: 4px;
+      background-color: #E0E0E0;
+      margin-top: 5px;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background-color: #34A853;
+      width: 0%;
+      transition: width 0.1s;
+    }
+    .sound-toggle {
+      display: flex;
+      align-items: center;
+    }
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 50px;
+      height: 24px;
+    }
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 24px;
+    }
+    .toggle-slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    input:checked + .toggle-slider {
+      background-color: #34A853;
+    }
+    input:checked + .toggle-slider:before {
+      transform: translateX(26px);
+    }
   </style>
 </head>
 <body>
@@ -123,7 +225,7 @@
   </div>
   
   <div class="container">
-    <h1>MoveNet Posture Camera</h1>
+    <h1>Posture Detection</h1>
     
     <div class="video-container">
       <video id="videoElement" width="640" height="480" autoplay></video>
@@ -132,10 +234,14 @@
         FPS: 0<br>
         Processing: 0ms
       </div>
+      <div id="postureStatus" class="posture-status">
+        <div><span class="status-indicator status-good"></span> Posture: Calibrating...</div>
+      </div>
     </div>
     
     <div class="controls">
-      <button id="toggleSkeletonBtn">Toggle Skeleton</button>
+      <button id="calibrateBtn" class="primary">Calibrate Posture</button>
+      <button id="toggleSkeletonBtn">Hide Skeleton</button>
       <button id="screenshotBtn">Take Screenshot</button>
       <button id="pauseBtn">Pause Processing</button>
       <button id="mirrorBtn">Mirror View</button>
@@ -151,63 +257,137 @@
           <option value="thunder">MoveNet Thunder (more accurate)</option>
         </select>
       </div>
-      
-      <div class="setting-row">
-        <label for="scaleInput">Processing Scale:</label>
-        <input type="range" id="scaleInput" min="0.1" max="1.0" step="0.1" value="0.5">
-        <span id="scaleValue">0.5</span>
-      </div>
-      
+
       <div class="setting-row">
         <label for="confidenceInput">Confidence Threshold:</label>
         <input type="range" id="confidenceInput" min="0.1" max="0.9" step="0.05" value="0.3">
         <span id="confidenceValue">0.3</span>
       </div>
+      
+      <div class="setting-row">
+        <label for="toleranceInput">Posture Tolerance:</label>
+        <input type="range" id="toleranceInput" min="0.05" max="0.5" step="0.05" value="0.2">
+        <span id="toleranceValue">0.2</span>
+      </div>
+
+      <div class="setting-row">
+        <label for="notifyFrequencyInput">Notification Frequency:</label>
+        <select id="notifyFrequencyInput">
+          <option value="5000">5 seconds</option>
+          <option value="10000" selected>10 seconds</option>
+          <option value="30000">30 seconds</option>
+          <option value="60000">1 minute</option>
+        </select>
+      </div>
+      
+      <div class="setting-row sound-toggle">
+        <label for="soundToggle">Sound Alerts:</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="soundToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
     </div>
   </div>
 
   <script>
-    // Configuration
-    const config = {
-      robotIp: "192.168.0.213",
-      robotPort: 5000,
-      scale: 0.5,
-      confidenceThreshold: 0.3,
-      modelType: 'lightning',
+    // State management
+    const state = {
+      // Model and processing
+      detector: null,
+      processingEnabled: true,
+      processing: false,
       showSkeleton: true,
       mirrorView: false,
-      processingEnabled: true
-    };
-    
-    // Performance tracking
-    const stats = {
-      lastFpsUpdateTime: 0,
+      modelType: 'lightning',
+      scale: 1.0,
+      confidenceThreshold: 0.3,
+
+      // Calibration
+      isCalibrated: false,
+      calibrationInProgress: false,
+      calibrationData: {
+        shouldersXDiffs: [],
+        yHeadShoulderDiffs: [],
+        maxFrameCount: 30
+      },
+      shouldersXThreshold: 0,
+      yHeadShoulderThreshold: 0,
+      
+      // Posture detection
+      toleranceMultiplier: 0.2,
+      headShouldersYMultiplier: 0.8,
+      
+      // Notifications
+      soundEnabled: true,
+      notificationFrequency: 10000,
+      lastNotificationTime: 0,
+      
+      // Performance
       frameCount: 0,
+      lastFpsUpdateTime: 0,
       fps: 0,
       processingTime: 0
     };
-    
+
+    // Audio manager
+    const audioManager = {
+      sound: null,
+      initialized: false,
+      lastPlayTime: 0,
+      cooldownPeriod: 2000, // ms between sounds
+
+      init() {
+        this.sound = new Audio('/sounds/alert.wav');
+        this.initialized = true;
+      },
+
+      playSound() {
+        if (!state.soundEnabled || !this.initialized) return;
+        
+        const now = Date.now();
+        if (now - this.lastPlayTime < this.cooldownPeriod) return;
+        
+        this.sound.play();
+        this.lastPlayTime = now;
+      }
+    };
+
+    // Initialize audio
+    audioManager.init();
+
     // DOM elements
     const video = document.getElementById('videoElement');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
     const statsElement = document.getElementById('stats');
+    const postureStatusElement = document.getElementById('postureStatus');
+    const calibrateBtn = document.getElementById('calibrateBtn');
     const toggleSkeletonBtn = document.getElementById('toggleSkeletonBtn');
     const screenshotBtn = document.getElementById('screenshotBtn');
     const pauseBtn = document.getElementById('pauseBtn');
     const mirrorBtn = document.getElementById('mirrorBtn');
     const modelSelect = document.getElementById('modelSelect');
-    const scaleInput = document.getElementById('scaleInput');
-    const scaleValue = document.getElementById('scaleValue');
     const confidenceInput = document.getElementById('confidenceInput');
     const confidenceValue = document.getElementById('confidenceValue');
+    const toleranceInput = document.getElementById('toleranceInput');
+    const toleranceValue = document.getElementById('toleranceValue');
+    const notifyFrequencyInput = document.getElementById('notifyFrequencyInput');
+    const soundToggle = document.getElementById('soundToggle');
     const loadingElement = document.getElementById('loading');
     
-    // Global variables
-    let detector = null;
-    let streamSocket = null;
-    let animationId = null;
-    let lastPose = null;
+    // Utility functions
+    function calculateAverageShoulderDistance() {
+      const data = state.calibrationData.shouldersXDiffs;
+      if (data.length === 0) return 0;
+      return data.reduce((a, b) => a + b, 0) / data.length;
+    }
+
+    function calculateAverageHeadShoulderDistance() {
+      const data = state.calibrationData.yHeadShoulderDiffs;
+      if (data.length === 0) return 0;
+      return data.reduce((a, b) => a + b, 0) / data.length;
+    }
     
     // Initialize the app
     async function init() {
@@ -224,15 +404,15 @@
     // Setup pose detector
     async function setupPoseDetector() {
       const modelConfig = {
-        modelType: poseDetection.movenet.modelType[config.modelType === 'thunder' ? 'SINGLEPOSE_THUNDER' : 'SINGLEPOSE_LIGHTNING']
+        modelType: poseDetection.movenet.modelType[state.modelType === 'thunder' ? 'SINGLEPOSE_THUNDER' : 'SINGLEPOSE_LIGHTNING']
       };
       
-      detector = await poseDetection.createDetector(
+      state.detector = await poseDetection.createDetector(
         poseDetection.SupportedModels.MoveNet, 
         modelConfig
       );
       
-      console.log('MoveNet detector initialized with model:', config.modelType);
+      console.log('MoveNet detector initialized with model:', state.modelType);
       loadingElement.style.display = 'none';
     }
     
@@ -243,19 +423,19 @@
       
       try {
         const modelConfig = {
-          modelType: poseDetection.movenet.modelType[config.modelType === 'thunder' ? 'SINGLEPOSE_THUNDER' : 'SINGLEPOSE_LIGHTNING']
+          modelType: poseDetection.movenet.modelType[state.modelType === 'thunder' ? 'SINGLEPOSE_THUNDER' : 'SINGLEPOSE_LIGHTNING']
         };
         
         // Cleanup old detector
-        detector = null;
+        state.detector = null;
         
         // Create new detector
-        detector = await poseDetection.createDetector(
+        state.detector = await poseDetection.createDetector(
           poseDetection.SupportedModels.MoveNet, 
           modelConfig
         );
         
-        console.log('MoveNet detector changed to:', config.modelType);
+        console.log('MoveNet detector changed to:', state.modelType);
       } catch (error) {
         console.error('Error changing model:', error);
         alert('Failed to change model: ' + error.message);
@@ -264,9 +444,291 @@
       }
     }
     
+    // Start calibration process
+    function startCalibration() {
+      // Clear previous calibration data
+      state.calibrationData.shouldersXDiffs = [];
+      state.calibrationData.yHeadShoulderDiffs = [];
+      state.calibrationInProgress = true;
+      state.isCalibrated = false;
+      
+      // Update UI
+      calibrateBtn.textContent = "Calibrating...";
+      calibrateBtn.disabled = true;
+      
+      // Create and show progress bar
+      const progressContainer = document.createElement('div');
+      progressContainer.className = 'calibration-progress';
+      const progressBar = document.createElement('div');
+      progressBar.className = 'progress-bar';
+      progressContainer.appendChild(progressBar);
+      calibrateBtn.parentNode.insertBefore(progressContainer, calibrateBtn.nextSibling);
+      
+      // Calibration progress animation
+      let progress = 0;
+      const calibrationDuration = 3000; // 3 seconds
+      const interval = 100;
+      const increment = (interval / calibrationDuration) * 100;
+      
+      const progressInterval = setInterval(() => {
+        progress += increment;
+        progressBar.style.width = `${Math.min(progress, 100)}%`;
+        
+        if (progress >= 100) {
+          clearInterval(progressInterval);
+          
+          // Complete calibration
+          finishCalibration();
+          
+          // Remove progress bar
+          progressContainer.remove();
+        }
+      }, interval);
+    }
+    
+    // Finish calibration process
+    function finishCalibration() {
+      const avgXDistance = calculateAverageShoulderDistance();
+      const avgYDistance = calculateAverageHeadShoulderDistance();
+      
+      if (avgXDistance > 0 && avgYDistance > 0) {
+        state.shouldersXThreshold = avgXDistance;
+        state.yHeadShoulderThreshold = avgYDistance;
+        state.isCalibrated = true;
+        console.log("Calibrated X threshold:", state.shouldersXThreshold);
+        console.log("Calibrated Y threshold:", state.yHeadShoulderThreshold);
+      }
+      
+      state.calibrationInProgress = false;
+      calibrateBtn.textContent = "Calibrate Posture";
+      calibrateBtn.disabled = false;
+    }
+    
+    // Check if arms are raised
+    function isArmsRaised(keypoints) {
+      const leftElbow = keypoints.find(kp => kp.name === "left_elbow");
+      const rightElbow = keypoints.find(kp => kp.name === "right_elbow");
+      const leftShoulder = keypoints.find(kp => kp.name === "left_shoulder");
+      const rightShoulder = keypoints.find(kp => kp.name === "right_shoulder");
+
+      // Check if all points are detected with good confidence
+      if (leftElbow && rightElbow && leftShoulder && rightShoulder &&
+          leftElbow.score > state.confidenceThreshold && 
+          rightElbow.score > state.confidenceThreshold && 
+          leftShoulder.score > state.confidenceThreshold && 
+          rightShoulder.score > state.confidenceThreshold) {
+          
+          // Check if elbows are above shoulders (allowing for some tolerance)
+          const leftArmRaised = leftElbow.y < (leftShoulder.y + 20);
+          const rightArmRaised = rightElbow.y < (rightShoulder.y + 20);
+
+          return leftArmRaised || rightArmRaised;
+      }
+      return false;
+    }
+    
+    // Draw skeleton and perform posture detection
+    function drawSkeleton(keypoints) {
+      // Draw keypoints
+      keypoints.forEach((keypoint) => {
+        if (keypoint.score > state.confidenceThreshold) {
+          ctx.beginPath();
+          ctx.arc(keypoint.x, keypoint.y, 4, 0, 2 * Math.PI);
+          ctx.fillStyle = "red";
+          ctx.fill();
+        }
+      });
+      
+      // Check if arms are raised before proceeding with posture checks
+      const armsRaised = isArmsRaised(keypoints);
+      
+      // Find key points needed for posture detection
+      const leftShoulder = keypoints.find(kp => kp.name === "left_shoulder");
+      const rightShoulder = keypoints.find(kp => kp.name === "right_shoulder");
+      const nose = keypoints.find(kp => kp.name === "nose");
+      
+      // Store calibration data if needed
+      if ((state.calibrationInProgress || !state.isCalibrated) && 
+          leftShoulder && rightShoulder && nose &&
+          leftShoulder.score > state.confidenceThreshold &&
+          rightShoulder.score > state.confidenceThreshold &&
+          nose.score > state.confidenceThreshold) {
+        
+        // Calculate X distance
+        const shoulderDistance = Math.abs(leftShoulder.x - rightShoulder.x);
+        state.calibrationData.shouldersXDiffs.push(shoulderDistance);
+        if (state.calibrationData.shouldersXDiffs.length > state.calibrationData.maxFrameCount) {
+          state.calibrationData.shouldersXDiffs.shift();
+        }
+        
+        // Calculate Y distance
+        const shoulderCenterY = (leftShoulder.y + rightShoulder.y) / 2;
+        const headShoulderDistance = Math.abs(nose.y - shoulderCenterY);
+        state.calibrationData.yHeadShoulderDiffs.push(headShoulderDistance);
+        if (state.calibrationData.yHeadShoulderDiffs.length > state.calibrationData.maxFrameCount) {
+          state.calibrationData.yHeadShoulderDiffs.shift();
+        }
+      }
+      
+      // Only do posture analysis if calibrated and not calibrating
+      let postureIssues = [];
+      let isPostureOK = true;
+      
+      if (state.isCalibrated && !state.calibrationInProgress && !armsRaised && 
+          leftShoulder && rightShoulder && nose &&
+          leftShoulder.score > state.confidenceThreshold &&
+          rightShoulder.score > state.confidenceThreshold &&
+          nose.score > state.confidenceThreshold) {
+        
+        // Calculate current values
+        const shoulderDistance = Math.abs(leftShoulder.x - rightShoulder.x);
+        const shoulderYDiff = Math.abs(leftShoulder.y - rightShoulder.y);
+        const shoulderCenterY = (leftShoulder.y + rightShoulder.y) / 2;
+        const headShoulderDistance = Math.abs(nose.y - shoulderCenterY);
+        
+        // Thresholds for X-axis (width)
+        const minThreshold = state.shouldersXThreshold * (1 - state.toleranceMultiplier);
+        const maxThreshold = state.shouldersXThreshold * (1 + state.toleranceMultiplier);
+        
+        // Threshold for Y-axis (height difference)
+        const maxYDifference = state.shouldersXThreshold * 0.15;
+        
+        // Head position threshold
+        const adjustedYThreshold = state.yHeadShoulderThreshold * state.headShouldersYMultiplier;
+        
+        // Check if shoulders are within acceptable ranges
+        const isShoulderWidthOK = shoulderDistance >= minThreshold && shoulderDistance <= maxThreshold;
+        const isShoulderHeightOK = shoulderYDiff <= maxYDifference;
+        const isHeadPositionOK = headShoulderDistance > adjustedYThreshold;
+        
+        // Determine posture issues
+        if (!isShoulderWidthOK) {
+          if (shoulderDistance < minThreshold) {
+            postureIssues.push("Shoulders too narrow - You're hunching forward!");
+          } else if (shoulderDistance > maxThreshold) {
+            postureIssues.push("Shoulders too wide - You're leaning back too much!");
+          }
+        }
+        if (!isShoulderHeightOK) {
+          postureIssues.push("Uneven shoulders - Level your shoulders!");
+        }
+        if (!isHeadPositionOK) {
+          postureIssues.push("Head position incorrect - Lift your chin!");
+        }
+        
+        isPostureOK = isShoulderWidthOK && isShoulderHeightOK && isHeadPositionOK;
+        
+        // Draw skeleton with color based on posture
+        if (leftShoulder && rightShoulder) {
+          // Draw shoulder line
+          ctx.beginPath();
+          ctx.moveTo(leftShoulder.x, leftShoulder.y);
+          ctx.lineTo(rightShoulder.x, rightShoulder.y);
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = isPostureOK ? "green" : "red";
+          ctx.stroke();
+          
+          // Visual indicator for shoulder height difference
+          if (!isShoulderHeightOK) {
+            ctx.beginPath();
+            ctx.moveTo(leftShoulder.x, leftShoulder.y - 10);
+            ctx.lineTo(leftShoulder.x, leftShoulder.y + 10);
+            ctx.moveTo(rightShoulder.x, rightShoulder.y - 10);
+            ctx.lineTo(rightShoulder.x, rightShoulder.y + 10);
+            ctx.strokeStyle = "red";
+            ctx.stroke();
+          }
+          
+          // Draw line from nose to shoulder center (for visualization)
+          if (nose) {
+            ctx.beginPath();
+            const centerX = (leftShoulder.x + rightShoulder.x) / 2;
+            const centerY = (leftShoulder.y + rightShoulder.y) / 2;
+            ctx.moveTo(nose.x, nose.y);
+            ctx.lineTo(centerX, centerY);
+            ctx.strokeStyle = isHeadPositionOK ? "green" : "red";
+            ctx.stroke();
+          }
+        }
+        
+        // Play sound and show notification for bad posture
+        if (!isPostureOK && postureIssues.length > 0) {
+          const now = Date.now();
+          if (now - state.lastNotificationTime > state.notificationFrequency) {
+            audioManager.playSound();
+            updatePostureStatus(postureIssues[0], 'bad');
+            state.lastNotificationTime = now;
+          }
+        } else {
+          updatePostureStatus('Posture looks good!', 'good');
+        }
+      } else if (armsRaised) {
+        updatePostureStatus('Arms raised - posture check paused', 'warning');
+      } else if (state.calibrationInProgress) {
+        updatePostureStatus('Calibrating...', 'warning');
+      } else if (!state.isCalibrated) {
+        updatePostureStatus('Please calibrate your posture', 'warning');
+      }
+      
+      // Draw other skeleton connections
+      if (state.showSkeleton) {
+        // Define connections between keypoints for skeleton
+        const connections = [
+          ['nose', 'left_eye'], ['nose', 'right_eye'],
+          ['left_eye', 'left_ear'], ['right_eye', 'right_ear'],
+          ['left_shoulder', 'left_elbow'], ['left_elbow', 'left_wrist'],
+          ['right_shoulder', 'right_elbow'], ['right_elbow', 'right_wrist'],
+          ['left_shoulder', 'left_hip'], ['right_shoulder', 'right_hip'],
+          ['left_hip', 'right_hip'],
+          ['left_hip', 'left_knee'], ['left_knee', 'left_ankle'],
+          ['right_hip', 'right_knee'], ['right_knee', 'right_ankle']
+        ];
+        
+        // Create lookup for keypoints by name
+        const keypointLookup = {};
+        keypoints.forEach(keypoint => {
+          keypointLookup[keypoint.name] = keypoint;
+        });
+        
+        // Draw connections
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'lime';
+        
+        connections.forEach(([name1, name2]) => {
+          // Skip shoulder connection as we've already drawn it above
+          if ((name1 === 'left_shoulder' && name2 === 'right_shoulder') ||
+              (name1 === 'right_shoulder' && name2 === 'left_shoulder')) {
+            return;
+          }
+          
+          const keypoint1 = keypointLookup[name1];
+          const keypoint2 = keypointLookup[name2];
+          
+          if (keypoint1 && keypoint2 && 
+              keypoint1.score > state.confidenceThreshold && 
+              keypoint2.score > state.confidenceThreshold) {
+            ctx.beginPath();
+            ctx.moveTo(keypoint1.x, keypoint1.y);
+            ctx.lineTo(keypoint2.x, keypoint2.y);
+            ctx.stroke();
+          }
+        });
+      }
+    }
+    
+    // Update posture status display
+    function updatePostureStatus(message, status) {
+      const indicator = postureStatusElement.querySelector('.status-indicator');
+      indicator.className = 'status-indicator status-' + status;
+      
+      postureStatusElement.innerHTML = `
+        <div><span class="status-indicator status-${status}"></span> Posture: ${message}</div>
+      `;
+    }
+    
     // Setup WebSocket for video stream
     function setupVideoStream() {
-      streamSocket = new WebSocket(`ws://${window.location.host}/stream`);
+      const streamSocket = new WebSocket(`ws://${window.location.host}/stream`);
       
       streamSocket.onopen = () => {
         console.log('WebSocket connected');
@@ -275,7 +737,7 @@
       streamSocket.onmessage = async (event) => {
         try {
           // Check if we're processing a frame already
-          if (!config.processingEnabled || stats.processing) {
+          if (!state.processingEnabled || state.processing) {
             return;
           }
 
@@ -285,8 +747,15 @@
           // Load the image
           const img = new Image();
           img.onload = async () => {
+            // Update canvas dimensions if needed
+            if (canvas.width !== img.width || canvas.height !== img.height) {
+              canvas.width = img.width;
+              canvas.height = img.height;
+            }
+            
             // Draw the image on the canvas
-            if (config.mirrorView) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (state.mirrorView) {
               ctx.save();
               ctx.scale(-1, 1);
               ctx.drawImage(img, -canvas.width, 0, canvas.width, canvas.height);
@@ -296,41 +765,36 @@
             }
             
             // Process pose if enabled
-            if (config.processingEnabled) {
-              stats.processing = true;
+            if (state.processingEnabled && state.detector) {
+              state.processing = true;
               const startTime = performance.now();
               
               try {
-                const poses = await detector.estimatePoses(img, {
+                const poses = await state.detector.estimatePoses(img, {
                   maxPoses: 1,
                   flipHorizontal: false
                 });
                 
                 if (poses.length > 0) {
-                  lastPose = poses[0];
-                  
-                  // Draw skeleton if enabled
-                  if (config.showSkeleton) {
-                    drawSkeleton(lastPose);
-                  }
+                  const keypoints = poses[0].keypoints;
+                  drawSkeleton(keypoints);
                 }
               } catch (error) {
                 console.error('Pose detection error:', error);
               }
               
-              stats.processingTime = performance.now() - startTime;
-              stats.processing = false;
+              state.processingTime = performance.now() - startTime;
+              state.processing = false;
             }
             
             // Update FPS counter
-            updateFps();
+            updateFPS();
             
             // Update stats display
             statsElement.innerHTML = `
-              FPS: ${stats.fps}<br>
-              Processing: ${stats.processingTime.toFixed(1)}ms<br>
-              Model: ${config.modelType}<br>
-              Scale: ${config.scale}
+              FPS: ${state.fps}<br>
+              Processing: ${state.processingTime.toFixed(1)}ms<br>
+              Model: ${state.modelType}
             `;
             
             // Cleanup
@@ -356,9 +820,13 @@
     
     // Setup event listeners
     function setupEventListeners() {
+      calibrateBtn.addEventListener('click', () => {
+        startCalibration();
+      });
+      
       toggleSkeletonBtn.addEventListener('click', () => {
-        config.showSkeleton = !config.showSkeleton;
-        toggleSkeletonBtn.textContent = config.showSkeleton ? 'Hide Skeleton' : 'Show Skeleton';
+        state.showSkeleton = !state.showSkeleton;
+        toggleSkeletonBtn.textContent = state.showSkeleton ? 'Hide Skeleton' : 'Show Skeleton';
       });
       
       screenshotBtn.addEventListener('click', () => {
@@ -370,92 +838,48 @@
       });
       
       pauseBtn.addEventListener('click', () => {
-        config.processingEnabled = !config.processingEnabled;
-        pauseBtn.textContent = config.processingEnabled ? 'Pause Processing' : 'Resume Processing';
+        state.processingEnabled = !state.processingEnabled;
+        pauseBtn.textContent = state.processingEnabled ? 'Pause Processing' : 'Resume Processing';
       });
       
       mirrorBtn.addEventListener('click', () => {
-        config.mirrorView = !config.mirrorView;
-        mirrorBtn.textContent = config.mirrorView ? 'Normal View' : 'Mirror View';
+        state.mirrorView = !state.mirrorView;
+        mirrorBtn.textContent = state.mirrorView ? 'Normal View' : 'Mirror View';
       });
       
       modelSelect.addEventListener('change', () => {
-        config.modelType = modelSelect.value;
+        state.modelType = modelSelect.value;
         changeDetectorModel();
       });
       
-      scaleInput.addEventListener('input', () => {
-        config.scale = parseFloat(scaleInput.value);
-        scaleValue.textContent = config.scale.toFixed(1);
-      });
-      
       confidenceInput.addEventListener('input', () => {
-        config.confidenceThreshold = parseFloat(confidenceInput.value);
-        confidenceValue.textContent = config.confidenceThreshold.toFixed(2);
-      });
-    }
-    
-    // Draw skeleton on canvas
-    function drawSkeleton(pose) {
-      const keypoints = pose.keypoints;
-      
-      // Define connections between keypoints for skeleton
-      const connections = [
-        ['nose', 'left_eye'], ['nose', 'right_eye'],
-        ['left_eye', 'left_ear'], ['right_eye', 'right_ear'],
-        ['left_shoulder', 'right_shoulder'], 
-        ['left_shoulder', 'left_elbow'], ['left_elbow', 'left_wrist'],
-        ['right_shoulder', 'right_elbow'], ['right_elbow', 'right_wrist'],
-        ['left_shoulder', 'left_hip'], ['right_shoulder', 'right_hip'],
-        ['left_hip', 'right_hip'],
-        ['left_hip', 'left_knee'], ['left_knee', 'left_ankle'],
-        ['right_hip', 'right_knee'], ['right_knee', 'right_ankle']
-      ];
-      
-      // Create lookup for keypoints by name
-      const keypointLookup = {};
-      keypoints.forEach(keypoint => {
-        keypointLookup[keypoint.name] = keypoint;
+        state.confidenceThreshold = parseFloat(confidenceInput.value);
+        confidenceValue.textContent = state.confidenceThreshold.toFixed(2);
       });
       
-      // Draw keypoints
-      keypoints.forEach(keypoint => {
-        if (keypoint.score >= config.confidenceThreshold) {
-          ctx.beginPath();
-          ctx.arc(keypoint.x, keypoint.y, 5, 0, 2 * Math.PI);
-          ctx.fillStyle = 'green';
-          ctx.fill();
-        }
+      toleranceInput.addEventListener('input', () => {
+        state.toleranceMultiplier = parseFloat(toleranceInput.value);
+        toleranceValue.textContent = state.toleranceMultiplier.toFixed(2);
       });
       
-      // Draw connections
-      ctx.strokeStyle = 'red';
-      ctx.lineWidth = 2;
+      notifyFrequencyInput.addEventListener('change', () => {
+        state.notificationFrequency = parseInt(notifyFrequencyInput.value);
+      });
       
-      connections.forEach(([name1, name2]) => {
-        const keypoint1 = keypointLookup[name1];
-        const keypoint2 = keypointLookup[name2];
-        
-        if (keypoint1 && keypoint2 && 
-            keypoint1.score >= config.confidenceThreshold && 
-            keypoint2.score >= config.confidenceThreshold) {
-          ctx.beginPath();
-          ctx.moveTo(keypoint1.x, keypoint1.y);
-          ctx.lineTo(keypoint2.x, keypoint2.y);
-          ctx.stroke();
-        }
+      soundToggle.addEventListener('change', () => {
+        state.soundEnabled = soundToggle.checked;
       });
     }
     
     // Update FPS counter
-    function updateFps() {
+    function updateFPS() {
       const now = performance.now();
-      stats.frameCount++;
+      state.frameCount++;
       
-      if (now - stats.lastFpsUpdateTime >= 1000) {
-        stats.fps = Math.round(stats.frameCount * 1000 / (now - stats.lastFpsUpdateTime));
-        stats.frameCount = 0;
-        stats.lastFpsUpdateTime = now;
+      if (now - state.lastFpsUpdateTime >= 1000) {
+        state.fps = Math.round(state.frameCount * 1000 / (now - state.lastFpsUpdateTime));
+        state.frameCount = 0;
+        state.lastFpsUpdateTime = now;
       }
     }
     
