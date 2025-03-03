@@ -33,6 +33,11 @@ class DogBrain:
         self.last_frame_time = 0
         self.frame_capture_success = False
         
+        self.keypoints_history = deque(maxlen=50)
+        
+        # Load MoveNet model
+        self._load_posture_model()
+        
         # Variables for the modified voice input system
         self.command_mode = False  # Will be set based on keyboard availability
         self.start_listening = False  # Flag for command-based listening
@@ -57,7 +62,7 @@ class DogBrain:
         self.currently_speaking = False
         self.current_action_task = None
         self.interrupt_event = asyncio.Event()
-        self.autonomous_mode = False 
+        self.autonomous_mode = True 
         
         # Claude client initialization
         self.claude_api_key = claude_api_key
@@ -65,6 +70,12 @@ class DogBrain:
         
         # Use Claude 3.7 Sonnet model
         self.claude_model = "claude-3-7-sonnet-20250219"
+        
+        cap = cv2.VideoCapture(self.video_url)
+        if not cap.isOpened():
+            print(f"Failed to open video stream at {self.video_url}")
+            return
+
         
         print(f"Dog brain initializing with Robot IP: {robot_ip}")
         print(f"Video URL set to: {self.video_url}")
@@ -78,14 +89,173 @@ class DogBrain:
         """Load the MoveNet posture detection model"""
         try:
             # Load MoveNet from TensorFlow Hub
-            model_name = "movenet_singlepose_thunder"
-            model_url = f"https://tfhub.dev/google/{model_name}/4"
+            model_name = "movenet_singlepose_lightning"
+            model_url = f"https://www.kaggle.com/models/google/movenet/tensorFlow2/singlepose-lightning/4"
             print(f"Loading posture detection model: {model_name}")
             self.posture_model = hub.load(model_url)
             print("Posture detection model loaded successfully")
         except Exception as e:
             print(f"Failed to load posture detection model: {e}")
             self.posture_model = None
+            
+    def _load_posture_model(self):
+        """Load the MoveNet posture detection model"""
+        try:
+            model_url = "https://tfhub.dev/google/movenet/singlepose/lightning/4"
+            print("Loading MoveNet model...")
+            self.posture_model = hub.load(model_url)
+            print("MoveNet model loaded successfully")
+        except Exception as e:
+            print(f"Failed to load model: {e}")
+            self.posture_model = None
+
+    def process_video(self):
+        """Video processing thread to display camera feed with skeleton"""
+        cap = cv2.VideoCapture(self.video_url)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to get frame")
+                continue
+
+            # Process frame for keypoints
+            processed_frame = self.draw_skeleton(frame)
+            
+            # Display processed frame
+            cv2.imshow('Robot Camera Feed', processed_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+        
+    def draw_keypoints(self, frame, keypoints, confidence_threshold):
+        """Draw keypoints and skeleton on the frame."""
+        y, x, c = frame.shape
+        shaped = np.squeeze(np.multiply(keypoints, [y, x, 1]))
+        
+        # COCO keypoint connections
+        edges = [
+            (0, 1), (0, 2), (1, 3), (2, 4),  # Face connections
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
+            (5, 11), (6, 12), (11, 12),  # Body
+            (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
+        ]
+        
+        # Draw the keypoints
+        for kp in shaped:
+            ky, kx, kp_conf = kp
+            if kp_conf > confidence_threshold:
+                cv2.circle(frame, (int(kx), int(ky)), 4, (0, 255, 0), -1)
+        
+        # Draw the skeleton
+        for edge in edges:
+            p1, p2 = edge
+            y1, x1, c1 = shaped[p1]
+            y2, x2, c2 = shaped[p2]
+            
+            if (c1 > confidence_threshold and c2 > confidence_threshold):
+                cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+        
+        return frame
+    
+    def main(self):
+        model_url = f"https://www.kaggle.com/models/google/movenet/tensorFlow2/singlepose-lightning/4"
+        model = hub.load(model_url)
+        movenet = model.signatures['serving_default']
+        # Initialize the camera
+         # Wait a moment for the stream to initialize
+        time.sleep(2)
+        
+        # FPS calculation variables
+        frame_count = 0
+        start_time = time.time()
+        fps = 0
+        
+        while True:
+            # Capture frame from robot camera
+            ret, frame = self.frame_queue
+            
+            if not ret or frame is None:
+                print("Waiting for valid frame...")
+                time.sleep(0.1)
+                continue
+            
+            # Calculate FPS
+            frame_count += 1
+            if frame_count >= 10:
+                end_time = time.time()
+                fps = frame_count / (end_time - start_time)
+                frame_count = 0
+                start_time = time.time()
+            
+            # Convert the image to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Resize and pad the image to make it square
+            img = tf.image.resize_with_pad(tf.expand_dims(frame_rgb, axis=0), 192, 192)
+            img = tf.cast(img, dtype=tf.int32)
+            
+            try:
+                # Run inference
+                results = movenet(img)
+                keypoints = results['output_0'].numpy()
+                
+                # Draw the keypoints on the frame
+                confidence_threshold = 0.3
+                frame_with_keypoints = self.draw_keypoints(frame.copy(), keypoints[0, 0, :, :], confidence_threshold)
+                
+                # Add FPS and instructions
+                cv2.putText(frame_with_keypoints, f"FPS: {fps:.1f}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame_with_keypoints, "Press 'q' to quit", (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Display the resulting frame
+                cv2.imshow('Robot Posture Camera', frame_with_keypoints)
+            except Exception as e:
+                print(f"Error processing frame: {e}")
+                
+            # Press 'q' to quit
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        # Release resources
+        cv2.destroyAllWindows()
+        print("Application closed.")
+    
+    def draw_skeleton(self, frame):
+        """Detect and draw body keypoints on the frame"""
+        if self.posture_model is None:
+            return frame
+
+        try:
+            # Resize and process image
+            img = tf.image.resize_with_pad(np.expand_dims(frame, axis=0), 192, 192)
+            input_img = tf.cast(img, dtype=tf.int32)
+            
+            # Run model inference
+            outputs = self.posture_model(input_img)
+            keypoints = outputs['output_0'].numpy()[0, 0]
+            
+            # Print raw coordinates
+            print("\nKeypoint Coordinates:")
+            for i, (y, x, conf) in enumerate(keypoints):
+                print(f"Point {i}: X={x:.3f}, Y={y:.3f}, Confidence={conf:.3f}")
+
+            # Draw keypoints on frame
+            height, width, _ = frame.shape
+            for y, x, conf in keypoints:
+                if conf > 0.3:  # Only draw points with sufficient confidence
+                    cv2.circle(frame, 
+                             (int(x * width), int(y * height)),
+                             5, (0, 255, 0), -1)
+
+            return frame
+
+        except Exception as e:
+            print(f"Skeleton drawing error: {e}")
+            return frame
     
     async def send_command_multiple(self, command, times=3, delay=0.1):
         """Send a command multiple times with delay to ensure it's received"""
@@ -1258,4 +1428,5 @@ if __name__ == "__main__":
         
     print(f"Starting DogBrain with Robot IP: {ROBOT_IP}")
     brain = DogBrain(ROBOT_IP, CLAUDE_API_KEY)
-    asyncio.run(brain.run())
+    #asyncio.run(brain.run())
+    brain.main()
