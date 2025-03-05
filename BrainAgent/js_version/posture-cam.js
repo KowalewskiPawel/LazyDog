@@ -62,24 +62,24 @@ async function initRobotWebSocket() {
     robotSocket = null;
     robotSocketAuthenticated = false;
   }
-  
+
   const wsUrl = `ws://${config.robotIp}:8888`;
   console.log(`Connecting to robot WebSocket at ${wsUrl}`);
-  
+
   try {
     robotSocket = new WebSocket(wsUrl);
-    
+
     robotSocket.onopen = () => {
       console.log('Robot WebSocket connection established, authenticating...');
-      
+
       // Send authentication immediately after connection
       robotSocket.send("admin:123456");
     };
-    
+
     robotSocket.onmessage = (event) => {
       try {
         console.log('Received from robot:', event.data);
-        
+
         // Check if this is the authentication response
         if (!robotSocketAuthenticated) {
           // Mark as authenticated after receiving the first response
@@ -90,16 +90,16 @@ async function initRobotWebSocket() {
         console.error('Error processing robot response:', error);
       }
     };
-    
+
     robotSocket.onerror = (error) => {
       console.error('Robot WebSocket error:', error);
     };
-    
+
     robotSocket.onclose = () => {
       console.log('Robot WebSocket connection closed');
       robotSocket = null;
       robotSocketAuthenticated = false;
-      
+
       // Set up reconnection if not already in progress
       if (!robotSocketReconnectInterval) {
         robotSocketReconnectInterval = setInterval(() => {
@@ -110,7 +110,7 @@ async function initRobotWebSocket() {
     };
   } catch (error) {
     console.error('Failed to create WebSocket connection:', error);
-    
+
     // Set up reconnection if not already in progress
     if (!robotSocketReconnectInterval) {
       robotSocketReconnectInterval = setInterval(() => {
@@ -167,7 +167,7 @@ app.post('/camera-control', async (req, res) => {
   try {
     // Map the internal command names to robot commands if needed
     let robotCommand;
-    
+
     // Simple mapping to keep the commands consistent
     switch (command) {
       case 'up':
@@ -203,9 +203,9 @@ app.post('/camera-control', async (req, res) => {
       case 'stop':
         robotCommand = 'DS';
         break;
-        case 'stop-side':
-          robotCommand = 'TS';
-          break;
+      case 'stop-side':
+        robotCommand = 'TS';
+        break;
       case 'steadyMode':
         robotCommand = 'steady';
         break;
@@ -213,24 +213,24 @@ app.post('/camera-control', async (req, res) => {
       default:
         robotCommand = command;
     }
-    
+
     // Check if WebSocket is connected and authenticated
     if (!robotSocket || robotSocket.readyState !== WebSocket.OPEN) {
       console.log('WebSocket not connected, attempting to reconnect...');
       initRobotWebSocket();
-      
+
       // Wait a short time for connection
       await new Promise(resolve => setTimeout(resolve, 1000));
-      
+
       // If still not connected, return error
       if (!robotSocket || robotSocket.readyState !== WebSocket.OPEN) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Robot WebSocket connection not available. Attempting to reconnect.' 
+        return res.status(503).json({
+          success: false,
+          message: 'Robot WebSocket connection not available. Attempting to reconnect.'
         });
       }
     }
-    
+
     // Check if authenticated
     if (!robotSocketAuthenticated) {
       return res.status(401).json({
@@ -238,11 +238,11 @@ app.post('/camera-control', async (req, res) => {
         message: 'Robot WebSocket not authenticated yet. Please try again in a moment.'
       });
     }
-    
+
     // Send the command through WebSocket
     console.log(`Sending robot command via WebSocket: ${robotCommand}`);
     robotSocket.send(robotCommand);
-    
+
     return res.json({
       success: true,
       message: `Command '${robotCommand}' sent to robot`
@@ -359,7 +359,7 @@ wss.on('connection', async (ws) => {
 server.listen(config.webPort, () => {
   console.log(`Web interface running at http://localhost:${config.webPort}`);
   console.log('Open this URL in your browser to view the camera feed');
-  
+
   // Initialize robot WebSocket connection
   initRobotWebSocket();
 
