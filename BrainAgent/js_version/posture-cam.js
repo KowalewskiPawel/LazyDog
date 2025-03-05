@@ -256,6 +256,84 @@ app.post('/camera-control', async (req, res) => {
   }
 });
 
+// Add these functions to your existing posture-cam.js file
+
+// Function to make the robot bark
+function makeRobotBark() {
+  if (!robotSocket || robotSocket.readyState !== WebSocket.OPEN || !robotSocketAuthenticated) {
+    console.log('Cannot bark: WebSocket not connected or authenticated');
+    return false;
+  }
+  
+  console.log('Making robot bark at slouching user');
+  robotSocket.send('bark');
+  
+  // Turn off buzzer after short delay (200ms for a quick bark)
+  setTimeout(() => {
+    robotSocket.send('bark');
+  }, 200);
+  
+  return true;
+}
+
+// Create a new endpoint for barking
+app.post('/robot-bark', (req, res) => {
+  const success = makeRobotBark();
+  res.json({
+    success,
+    message: success ? 'Robot barked successfully' : 'Failed to make robot bark'
+  });
+});
+
+// Create a new bark sequence function (for more complex barking patterns)
+function barkSequence(pattern = 'alert') {
+  if (!robotSocket || robotSocket.readyState !== WebSocket.OPEN || !robotSocketAuthenticated) {
+    console.log('Cannot bark sequence: WebSocket not connected or authenticated');
+    return false;
+  }
+  
+  const patterns = {
+    short: [[0.1, 0.1]],
+    normal: [[0.2, 0.1], [0.2, 0.1]],
+    excited: [[0.1, 0.05], [0.1, 0.05], [0.2, 0.1]],
+    alert: [[0.3, 0.1], [0.1, 0.05], [0.1, 0.05]]
+  };
+  
+  const selectedPattern = patterns[pattern] || patterns.normal;
+  
+  // Execute bark sequence
+  let currentIndex = 0;
+  
+  function executeNextBark() {
+    if (currentIndex >= selectedPattern.length) return;
+    
+    const [duration, pause] = selectedPattern[currentIndex];
+    robotSocket.send('bark');
+    
+    setTimeout(() => {
+      robotSocket.send('bark');
+      currentIndex++;
+      
+      if (currentIndex < selectedPattern.length) {
+        setTimeout(executeNextBark, pause * 1000);
+      }
+    }, duration * 1000);
+  }
+  
+  executeNextBark();
+  return true;
+}
+
+// Create a new endpoint for bark sequences
+app.post('/robot-bark-sequence', (req, res) => {
+  const { pattern } = req.body;
+  const success = barkSequence(pattern);
+  res.json({
+    success,
+    message: success ? `Robot bark sequence '${pattern}' started` : 'Failed to start bark sequence'
+  });
+});
+
 // Handle WebSocket connections
 wss.on('connection', async (ws) => {
   console.log('Client connected');

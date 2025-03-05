@@ -577,6 +577,7 @@
     <button class="control-button" data-command="jump">Jump</button>
     <button class="control-button" data-command="handshake">Handshake</button>
     <button class="control-button" id="steadyBtn" data-command="steady">Steady</button>
+    <button class="control-button" id="barkBtn" data-command="bark">Bark</button>
   </div>
   
   <div class="control-feedback" id="controlFeedback">
@@ -625,6 +626,24 @@
           <span class="toggle-slider"></span>
         </label>
       </div>
+
+      <div class="setting-row bark-toggle">
+        <label for="barkToggle">Robot Bark on Bad Posture:</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="barkToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      
+      <div class="setting-row">
+        <label for="barkPatternSelect">Bark Pattern:</label>
+        <select id="barkPatternSelect">
+          <option value="short">Short (Single Bark)</option>
+          <option value="normal" selected>Normal (Double Bark)</option>
+          <option value="excited">Excited (Multiple Barks)</option>
+          <option value="alert">Alert (Alarm Pattern)</option>
+        </select>
+      </div>
     </div>
   </div>
 
@@ -640,6 +659,10 @@
       modelType: 'lightning',
       scale: 1.0,
       confidenceThreshold: 0.3,
+
+      robotBarkEnabled: true,
+      barkPattern: 'normal',
+      barkCooldown: false,
 
       // Calibration
       isCalibrated: false,
@@ -721,7 +744,9 @@
     const controlFeedback = document.getElementById('controlFeedback');
     const robotStatus = document.getElementById('robotStatus');
     const commandStatus = document.getElementById('commandStatus');
-    
+    const barkToggle = document.getElementById('barkToggle');
+    const barkPatternSelect = document.getElementById('barkPatternSelect');
+    const barkBtn = document.getElementById('barkBtn');
     // Utility functions
     function calculateAverageShoulderDistance() {
       const data = state.calibrationData.shouldersXDiffs;
@@ -734,6 +759,71 @@
       if (data.length === 0) return 0;
       return data.reduce((a, b) => a + b, 0) / data.length;
     }
+
+    // Robot bark function
+function makeRobotBark(pattern = null) {
+  if (state.barkCooldown) return;
+  
+  state.barkCooldown = true;
+  
+  if (pattern) {
+    executeBarkPattern(pattern);
+  } else {
+    // Simple single bark
+    sendCameraCommand('bark');
+    setTimeout(() => {
+      sendCameraCommand('bark');
+      
+      // Reset cooldown after a delay
+      setTimeout(() => {
+        state.barkCooldown = false;
+      }, 500);
+    }, 200);
+  }
+}
+
+// Execute bark pattern
+function executeBarkPattern(pattern) {
+  const patterns = {
+    short: [[0.1, 0.1]],
+    normal: [[0.2, 0.1], [0.2, 0.1]],
+    excited: [[0.1, 0.05], [0.1, 0.05], [0.2, 0.1]],
+    alert: [[0.3, 0.1], [0.1, 0.05], [0.1, 0.05]]
+  };
+  
+  const selectedPattern = patterns[pattern] || patterns.normal;
+  let currentIndex = 0;
+  
+  function executeNextBark() {
+    if (currentIndex >= selectedPattern.length) {
+      // Pattern complete, reset cooldown
+      setTimeout(() => {
+        state.barkCooldown = false;
+      }, 1000);
+      return;
+    }
+    
+    const [duration, pause] = selectedPattern[currentIndex];
+    sendCameraCommand('bark');
+    
+    setTimeout(() => {
+      sendCameraCommand('bark');
+      currentIndex++;
+      
+      if (currentIndex < selectedPattern.length) {
+        setTimeout(executeNextBark, pause * 1000);
+      } else {
+        // Pattern complete, reset cooldown
+        setTimeout(() => {
+          state.barkCooldown = false;
+        }, 1000);
+      }
+    }, duration * 1000);
+  }
+  
+  // Start the pattern
+  executeNextBark();
+}
     
     // Robot control function
     function sendCameraCommand(command) {
@@ -1156,6 +1246,10 @@
           const now = Date.now();
           if (now - state.lastNotificationTime > state.notificationFrequency) {
             audioManager.playSound();
+            // Make robot bark if enabled
+            if (state.robotBarkEnabled) {
+              makeRobotBark(state.barkPattern);
+            }
             updatePostureStatus(postureIssues[0], 'bad');
             state.lastNotificationTime = now;
           }
@@ -1368,6 +1462,20 @@
       
       soundToggle.addEventListener('change', () => {
         state.soundEnabled = soundToggle.checked;
+      });
+
+      barkToggle.addEventListener('change', () => {
+        state.robotBarkEnabled = barkToggle.checked;
+      });
+
+      barkPatternSelect.addEventListener('change', () => {
+        state.barkPattern = barkPatternSelect.value;
+      });
+
+      // Add bark button click handler
+      barkBtn.addEventListener('click', () => {
+        makeRobotBark(state.barkPattern);
+        // setTimeout(() => sendCameraCommand('bark'), 200);
       });
     }
     
