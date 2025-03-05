@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html>
-<head>
+<!-- saved from url=(0022)http://localhost:3000/ -->
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
   <title>Posture Detection</title>
-  <meta charset="utf-8">
+  
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- TensorFlow.js -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0"></script>
+  <script src="./Posture Detection_files/tfjs@4.10.0"></script>
   <!-- MoveNet model -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <script src="./Posture Detection_files/pose-detection"></script>
   
   <style>
     :root {
@@ -508,7 +508,7 @@
   </style>
 </head>
 <body>
-  <div id="loading" class="loading">
+  <div id="loading" class="loading" style="display: none;">
     <div class="loader"></div>
     <div>Loading MoveNet model...</div>
   </div>
@@ -517,19 +517,20 @@
     <h1>Posture Detection</h1>
     
     <div class="video-container">
-      <video id="videoElement" width="640" height="480" autoplay></video>
+      <video id="videoElement" width="640" height="480" autoplay=""></video>
       <canvas id="canvas" width="640" height="480"></canvas>
       <div id="stats" class="stats">
-        FPS: 0<br>
-        Processing: 0ms
-      </div>
+              FPS: 44<br>
+              Processing: 12.9ms<br>
+              Model: lightning
+            </div>
       <div id="postureStatus" class="posture-status">
-        <div><span class="status-indicator status-good"></span> Posture: Calibrating...</div>
+        <div><span class="status-indicator status-warning"></span> Posture: Calibrating...</div>
       </div>
     </div>
     
     <div class="controls">
-      <button id="calibrateBtn" class="primary">Calibrate Posture</button>
+      <button id="calibrateBtn" class="primary" disabled="">Calibrating...</button><div class="calibration-progress"><div class="progress-bar" style="width: 86.6667%;"></div></div>
       <button id="toggleSkeletonBtn">Hide Skeleton</button>
       <button id="screenshotBtn">Take Screenshot</button>
       <button id="pauseBtn">Pause Processing</button>
@@ -540,37 +541,20 @@
 <div class="camera-controls">
   <h2>Robot Controls</h2>
   <div class="control-pad">
-    <button class="control-button up-button" 
-            data-command="forward" 
-            data-stop-command="DS">▲</button>
-    <button class="control-button left-button" 
-            data-command="left" 
-            data-stop-command="TS">◀</button>
-    <button class="control-button center-button" 
-              data-command="steady">■</button>
-    <button class="control-button right-button" 
-            data-command="right" 
-            data-stop-command="TS">▶</button>
-    <button class="control-button down-button" 
-            data-command="backward" 
-            data-stop-command="DS">▼</button>
+    <button class="control-button up-button" data-command="forward" data-stop-command="DS">▲</button>
+    <button class="control-button left-button" data-command="left" data-stop-command="TS">◀</button>
+    <button class="control-button center-button" data-command="steady">■</button>
+    <button class="control-button right-button" data-command="right" data-stop-command="TS">▶</button>
+    <button class="control-button down-button" data-command="backward" data-stop-command="DS">▼</button>
   </div>
 
   <div class="camera-controls">
     <h2>Camera Controls</h2>
     <div class="control-pad">
-      <button class="control-button up-button" 
-              data-command="up" 
-              data-stop-command="UDstop">▲</button>
-      <button class="control-button left-button" 
-              data-command="lookleft" 
-              data-stop-command="LRstop">◀</button>
-      <button class="control-button right-button" 
-              data-command="lookright" 
-              data-stop-command="LRstop">▶</button>
-      <button class="control-button down-button" 
-              data-command="down" 
-              data-stop-command="UDstop">▼</button>
+      <button class="control-button up-button" data-command="up" data-stop-command="UDstop">▲</button>
+      <button class="control-button left-button" data-command="lookleft" data-stop-command="LRstop">◀</button>
+      <button class="control-button right-button" data-command="lookright" data-stop-command="LRstop">▶</button>
+      <button class="control-button down-button" data-command="down" data-stop-command="UDstop">▼</button>
     </div>
   
   <div class="function-controls">
@@ -613,7 +597,7 @@
         <label for="notifyFrequencyInput">Notification Frequency:</label>
         <select id="notifyFrequencyInput">
           <option value="5000">5 seconds</option>
-          <option value="10000" selected>10 seconds</option>
+          <option value="10000" selected="">10 seconds</option>
           <option value="30000">30 seconds</option>
           <option value="60000">1 minute</option>
         </select>
@@ -622,7 +606,7 @@
       <div class="setting-row sound-toggle">
         <label for="soundToggle">Sound Alerts:</label>
         <label class="toggle-switch">
-          <input type="checkbox" id="soundToggle" checked>
+          <input type="checkbox" id="soundToggle" checked="">
           <span class="toggle-slider"></span>
         </label>
       </div>
@@ -630,7 +614,7 @@
       <div class="setting-row bark-toggle">
         <label for="barkToggle">Robot Bark on Bad Posture:</label>
         <label class="toggle-switch">
-          <input type="checkbox" id="barkToggle" checked>
+          <input type="checkbox" id="barkToggle" checked="">
           <span class="toggle-slider"></span>
         </label>
       </div>
@@ -639,7 +623,7 @@
         <label for="barkPatternSelect">Bark Pattern:</label>
         <select id="barkPatternSelect">
           <option value="short">Short (Single Bark)</option>
-          <option value="normal" selected>Normal (Double Bark)</option>
+          <option value="normal" selected="">Normal (Double Bark)</option>
           <option value="excited">Excited (Multiple Barks)</option>
           <option value="alert">Alert (Alarm Pattern)</option>
         </select>
@@ -649,16 +633,19 @@
         <label for="reactionTypeSelect">Slouch Reaction:</label>
         <select id="reactionTypeSelect">
           <option value="bark">Bark Only</option>
-          <option value="approach" selected>Approach & Bark</option>
-          <option value="handshake">Handshake & Bark</option>
-          <option value="full">Full Reaction (Approach, Handshake & Bark)</option>
+          <option value="approach" selected="">Approach (Subtle)</option>
+          <option value="handshake">Handshake</option>
+          <option value="full">Full Reaction (Spaced Out)</option>
         </select>
       </div>
       
       <div class="setting-row">
-        <label for="reactionIntensity">Reaction Intensity:</label>
-        <input type="range" id="reactionIntensity" min="1" max="5" step="1" value="3">
-        <span id="intensityValue">3</span>
+        <label for="reactionFrequency">Reaction Frequency:</label>
+        <select id="reactionFrequency">
+          <option value="15000">Low (15 seconds)</option>
+          <option value="30000" selected="">Medium (30 seconds)</option>
+          <option value="60000">High (60 seconds)</option>
+        </select>
       </div>
     </div>
   </div>
@@ -777,10 +764,6 @@
     // Reaction intensity slider
     const reactionIntensity = document.getElementById('reactionIntensity');
     const intensityValue = document.getElementById('intensityValue');
-    reactionIntensity.addEventListener('input', () => {
-      state.reactionIntensity = parseInt(reactionIntensity.value);
-      intensityValue.textContent = state.reactionIntensity;
-});
 
     // Utility functions
     function calculateAverageShoulderDistance() {
@@ -796,25 +779,93 @@
     }
 
     // Robot bark function
-function makeRobotBark(pattern = null) {
+// Simplified single bark function
+function makeRobotBark() {
   if (state.barkCooldown) return;
   
   state.barkCooldown = true;
   
-  if (pattern) {
-    executeBarkPattern(pattern);
-  } else {
-    // Simple single bark
+  // Simple single bark
+  sendCameraCommand('bark');
+  setTimeout(() => {
     sendCameraCommand('bark');
+    
+    // Longer cooldown to prevent overloading
     setTimeout(() => {
-      sendCameraCommand('bark');
-      
-      // Reset cooldown after a delay
-      setTimeout(() => {
-        state.barkCooldown = false;
-      }, 500);
-    }, 200);
+      state.barkCooldown = false;
+    }, 3000); // 3 second cooldown
+  }, 200);
+}
+
+// Last command time tracking
+let lastCommandTime = 0;
+const MIN_COMMAND_INTERVAL = 100; // Minimum 100ms between commands
+
+// Enhanced robot control function with rate limiting
+function sendCameraCommand(command) {
+  const now = Date.now();
+  
+  // Rate limiting check
+  if (now - lastCommandTime < MIN_COMMAND_INTERVAL) {
+    console.log(`Command '${command}' skipped due to rate limiting`);
+    return;
   }
+  
+  if (state.controlCooldown) return;
+  
+  state.controlCooldown = true;
+  lastCommandTime = now;
+  
+  commandStatus.textContent = `Sending command: ${command}...`;
+  
+  // Add visual feedback for the active button
+  const button = document.querySelector(`[data-command="${command}"]`);
+  if (button) {
+    button.style.backgroundColor = '#EA4335';
+  }
+  
+  fetch('/camera-control', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ command })
+  })
+  .then(response => {
+    if (!response.ok) {
+      throw new Error(`Status: ${response.status} - ${response.statusText}`);
+    }
+    return response.json();
+  })
+  .then(data => {
+    commandStatus.textContent = data.message || 'Command sent successfully';
+    
+    // Reset button appearance
+    if (button && command !== 'steady') {
+      setTimeout(() => {
+        button.style.backgroundColor = '';
+      }, 200);
+    }
+    
+    // Reset cooldown after a longer delay
+    setTimeout(() => {
+      state.controlCooldown = false;
+    }, 300); // Longer cooldown for better stability
+  })
+  .catch(error => {
+    console.error('Error sending command:', error);
+    commandStatus.textContent = `Error: ${error.message}`;
+    
+    // Reset button appearance
+    if (button) {
+      button.style.backgroundColor = '';
+    }
+    
+    // Reset cooldown
+    setTimeout(() => {
+      state.controlCooldown = false;
+    }, 300);
+  });
 }
 
 // Execute bark pattern
@@ -875,10 +926,14 @@ function reactToSlouching() {
   const executeSequence = async () => {
     try {
       // Start with light indicator
+      await sendCommandWithPromise('light red');
+      await sleep(300); // Wait 300ms
       
       switch(state.reactionType) {
         case 'bark':
           // Just a single bark - keep it simple
+          await sendCommandWithPromise('bark');
+          await sleep(200);
           await sendCommandWithPromise('bark');
           break;
           
@@ -891,14 +946,18 @@ function reactToSlouching() {
           
           // Single bark
           await sendCommandWithPromise('bark');
+          await sleep(150);
+          await sendCommandWithPromise('bark');
           break;
           
         case 'handshake':
           // Do handshake (built-in sequence, no need for multiple commands)
-          await sendCommandWithPromise('handshake');
+          await sendCommandWithPromise('handShake');
           await sleep(1000); // Wait for handshake to complete
           
           // Single bark
+          await sendCommandWithPromise('bark');
+          await sleep(150);
           await sendCommandWithPromise('bark');
           break;
           
@@ -906,22 +965,22 @@ function reactToSlouching() {
           // Simplified full reaction
           await sendCommandWithPromise('forward');
           await sleep(150 * intensity); 
-          await sleep(500)
           await sendCommandWithPromise('DS'); // Stop moving
-          await sleep(100)
-          await sendCommandWithPromise('DS');
-          await sleep(100)
-          await sendCommandWithPromise('DS');
-          await sleep(2000); // Significant pause
+          await sleep(500); // Significant pause
           
-          await sendCommandWithPromise('handshake');
+          await sendCommandWithPromise('handShake');
           await sleep(1000); // Wait for handshake
           
           // Single bark
           await sendCommandWithPromise('bark');
+          await sleep(150);
+          await sendCommandWithPromise('bark');
           break;
       }
+      
+      // Turn off light at the end
       await sleep(500);
+      await sendCommandWithPromise('light off');
       
     } catch (error) {
       console.error('Error during slouch reaction:', error);
@@ -954,63 +1013,7 @@ function sendCommandWithPromise(command) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-    // Robot control function
-    function sendCameraCommand(command) {
-      if (state.controlCooldown) return;
-      
-      state.controlCooldown = true;
-      commandStatus.textContent = `Sending command: ${command}...`;
-      
-      // Add visual feedback for the active button
-      const button = document.querySelector(`[data-command="${command}"]`);
-      if (button) {
-        button.style.backgroundColor = '#EA4335'; // Highlight color when active
-      }
-      
-      fetch('/camera-control', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ command })
-      })
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`Status: ${response.status} - ${response.statusText}`);
-        }
-        return response.json();
-      })
-      .then(data => {
-        commandStatus.textContent = data.message || 'Command sent successfully';
-        
-        // Reset button appearance only for non-toggle buttons
-        if (button && command !== 'steady') {
-          setTimeout(() => {
-            button.style.backgroundColor = ''; // Return to default color
-          }, 200);
-        }
-        
-        // Reset cooldown after a short delay
-        setTimeout(() => {
-          state.controlCooldown = false;
-        }, 100); // Shorter cooldown for better responsiveness
-      })
-      .catch(error => {
-        console.error('Error sending command:', error);
-        commandStatus.textContent = `Error: ${error.message}`;
-        
-        // Reset button appearance
-        if (button) {
-          button.style.backgroundColor = '';
-        }
-        
-        // Reset cooldown
-        setTimeout(() => {
-          state.controlCooldown = false;
-        }, 100);
-      });
-    }
-    
+
     // Initialize the app
     async function init() {
       try {
@@ -1371,20 +1374,26 @@ function sleep(ms) {
         }
         
         // Play sound and show notification for bad posture
-        if (!isPostureOK && postureIssues.length > 0) {
-          const now = Date.now();
-          if (now - state.lastNotificationTime > state.notificationFrequency) {
-            audioManager.playSound();
-            // Make robot bark if enabled
-            if (state.robotBarkEnabled) {
-              reactToSlouching();
-            }
-            updatePostureStatus(postureIssues[0], 'bad');
-            state.lastNotificationTime = now;
+        // Play sound and show notification for bad posture
+      if (!isPostureOK && postureIssues.length > 0) {
+        const now = Date.now();
+        // Use a much longer notification frequency (from dropdown)
+        const selectedFrequency = parseInt(document.getElementById('reactionFrequency').value);
+        
+        if (now - state.lastNotificationTime > selectedFrequency) {
+          audioManager.playSound();
+          updatePostureStatus(postureIssues[0], 'bad');
+          
+          // Trigger robot reaction if enabled - but with limits
+          if (state.robotBarkEnabled && !state.reactionInProgress) {
+            reactToSlouching();
           }
-        } else {
-          updatePostureStatus('Posture looks good!', 'good');
+          
+          state.lastNotificationTime = now;
         }
+      } else {
+        updatePostureStatus('Posture looks good!', 'good');
+      }
       } else if (armsRaised) {
         updatePostureStatus('Arms raised - posture check paused', 'warning');
       } else if (state.calibrationInProgress) {
@@ -1606,6 +1615,11 @@ function sleep(ms) {
         makeRobotBark(state.barkPattern);
         // setTimeout(() => sendCameraCommand('bark'), 200);
       });
+
+      reactionIntensity.addEventListener('input', () => {
+      state.reactionIntensity = parseInt(reactionIntensity.value);
+      intensityValue.textContent = state.reactionIntensity;
+});
     }
     
     // Update FPS counter
@@ -1623,5 +1637,5 @@ function sleep(ms) {
     // Initialize when the page loads
     window.addEventListener('load', init);
   </script>
-</body>
-</html>
+
+</div></body></html>
