@@ -366,6 +366,115 @@ app.post('/ai-response', async (req, res) => {
   }
 });
 
+// ... existing code ...
+
+// Add a new endpoint for voice transcription and AI response
+app.post('/voice-interaction', async (req, res) => {
+  const { audioBlob, imageData, transcription } = req.body;
+  
+  try {
+    // Get API key from environment variables
+    const claudeApiKey = process.env.CLAUDE_API_KEY;
+    
+    if (!claudeApiKey) {
+      throw new Error('Claude API key not configured on server');
+    }
+    
+    // Get response from Claude with image and voice transcription
+    const response = await getClaudeVoiceResponse(transcription, imageData, claudeApiKey);
+    
+    // Format response for robot speech
+    const robotResponse = response.startsWith('speak:') ? response : `speak:${response}`;
+    
+    // Send the response to the robot
+    if (robotSocket && robotSocket.readyState === WebSocket.OPEN && robotSocketAuthenticated) {
+      robotSocket.send(robotResponse);
+    }
+    
+    return res.json({
+      success: true,
+      response,
+      originalTranscription: transcription
+    });
+  } catch (error) {
+    console.error('Voice interaction error:', error);
+    return res.status(500).json({
+      success: false,
+      message: `Error: ${error.message}`
+    });
+  }
+});
+
+// Claude API implementation with image and voice transcription support
+async function getClaudeVoiceResponse(transcription, imageData, apiKey) {
+  const anthropic = require('@anthropic-ai/sdk');
+  const client = new anthropic.Anthropic({
+    apiKey: apiKey
+  });
+  
+  try {
+    // Prepare messages with text and image
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `The user asked: "${transcription}". 
+            
+            If they're asking about their posture, provide a helpful analysis based on the image.
+            If they're asking a general question, answer it appropriately.
+            
+            Format your response as a speech command that I can send directly to my robot. The format must be exactly "speak:YOUR MESSAGE HERE". Keep the response concise (under 150 characters).`
+          }
+        ]
+      }
+    ];
+    
+    // Add image if provided
+    if (imageData) {
+      // Remove the data:image/jpeg;base64, prefix if present
+      const base64Image = imageData.replace(/^data:image\/\w+;base64,/, '');
+      
+      messages[0].content.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/jpeg',
+          data: base64Image
+        }
+      });
+    }
+    
+    // Use the current most appropriate model
+    const response = await client.messages.create({
+      model: 'claude-3-7-sonnet-20250219',
+      max_tokens: 200,
+      system: "You are a helpful robot assistant who provides concise and friendly responses. When analyzing posture, be specific but brief.",
+      messages: messages
+    });
+    
+    let responseText = response.content[0].text.trim();
+    
+    // Ensure response is in the correct format
+    if (!responseText.startsWith('speak:')) {
+      responseText = 'speak:' + responseText;
+    }
+    
+    // Limit response length
+    if (responseText.length > 158) { // "speak:" plus 150 characters
+      responseText = responseText.substring(0, 158);
+    }
+    
+    return responseText;
+  } catch (error) {
+    console.error('Claude API error:', error);
+    // Fallback response if API call fails
+    return 'speak:Sorry, I encountered an error processing your request.';
+  }
+}
+
+// ... existing code ...
 // AI Integration endpoint with image support
 app.post('/claude-posture-response', async (req, res) => {
   const { postureIssues, imageData, personality } = req.body;

@@ -313,6 +313,70 @@
       transform: translateX(26px);
     }
     
+    .voice-controls {
+    margin-top: 20px;
+    padding: 24px;
+    background-color: var(--bg-secondary);
+    border-radius: var(--border-radius);
+    box-shadow: var(--shadow);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  
+  .voice-button-container {
+    display: flex;
+    justify-content: center;
+    margin: 16px 0;
+  }
+  
+  .voice-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 15px 25px;
+    background-color: var(--accent-primary);
+    color: white;
+    border: none;
+    border-radius: 50px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: all 0.3s;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+  }
+
+  .voice-button:hover {
+    background-color: var(--accent-secondary);
+    transform: translateY(-2px);
+  }
+  
+  .voice-button:active, .voice-button.recording {
+    background-color: #EA4335;
+    transform: scale(1.05);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+  
+  .microphone-icon {
+    margin-right: 10px;
+    font-size: 20px;
+  }
+  
+  .transcription-display, .response-display {
+    background-color: var(--bg-tertiary);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--border-radius);
+    padding: 12px;
+    margin: 12px 0;
+    min-height: 50px;
+    max-height: 100px;
+    overflow-y: auto;
+    font-size: 14px;
+    color: var(--text-primary);
+  }
+
+  .response-display {
+    font-weight: 500;
+    color: var(--accent-primary);
+    border-left: 4px solid var(--accent-primary);
+  }
     /* Loading screen */
     .loading {
       position: fixed;
@@ -535,6 +599,22 @@
       <button id="screenshotBtn">Take Screenshot</button>
       <button id="pauseBtn">Pause Processing</button>
       <button id="mirrorBtn">Mirror View</button>
+    </div>
+
+    <div class="voice-controls">
+      <h2>Voice Interaction</h2>
+      <div class="voice-button-container">
+        <button id="voiceInteractionBtn" class="voice-button">
+          <i class="microphone-icon">🎤</i>
+          <span id="voiceButtonText">Hold to Speak</span>
+        </button>
+      </div>
+      <div id="transcriptionDisplay" class="transcription-display">
+        Transcription will appear here...
+      </div>
+      <div id="responseDisplay" class="response-display">
+        Response will appear here...
+      </div>
     </div>
     
 <!-- Robot Controls -->
@@ -813,6 +893,17 @@ const aiIntegrationToggle = document.getElementById('aiIntegrationToggle');
 const aiModelSelect = document.getElementById('aiModelSelect');
 const aiPersonalitySelect = document.getElementById('aiPersonalitySelect');
 
+const voiceInteractionBtn = document.getElementById('voiceInteractionBtn');
+  const voiceButtonText = document.getElementById('voiceButtonText');
+  const transcriptionDisplay = document.getElementById('transcriptionDisplay');
+  const responseDisplay = document.getElementById('responseDisplay');
+  
+  // Speech recognition and recording variables
+  let mediaRecorder;
+  let audioChunks = [];
+  let isRecording = false;
+  let recognition;
+
     // Utility functions
     function calculateAverageShoulderDistance() {
       const data = state.calibrationData.shouldersXDiffs;
@@ -826,6 +917,164 @@ const aiPersonalitySelect = document.getElementById('aiPersonalitySelect');
       return data.reduce((a, b) => a + b, 0) / data.length;
     }
 
+    function setupSpeechRecognition() {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+      
+      recognition.onresult = (event) => {
+        const transcript = Array.from(event.results)
+          .map(result => result[0].transcript)
+          .join('');
+        
+        transcriptionDisplay.textContent = transcript;
+      };
+      
+      recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+        transcriptionDisplay.textContent = `Error: ${event.error}`;
+      };
+      
+      return true;
+    } else {
+      console.error('Speech recognition not supported');
+      transcriptionDisplay.textContent = 'Speech recognition not supported by your browser';
+      return false;
+    }
+  }
+
+  async function startRecording() {
+    if (isRecording) return;
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      mediaRecorder = new MediaRecorder(stream);
+      audioChunks = [];
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
+        }
+      };
+      
+      mediaRecorder.start();
+      isRecording = true;
+      
+      voiceInteractionBtn.classList.add('recording');
+      voiceButtonText.textContent = 'Recording...';
+      
+      // Start speech recognition if available
+      if (recognition) {
+        recognition.start();
+      }
+    } catch (error) {
+      console.error('Error accessing microphone:', error);
+      transcriptionDisplay.textContent = `Microphone error: ${error.message}`;
+    }
+  }
+  
+  async function stopRecording() {
+    if (!isRecording) return;
+    
+    // Stop speech recognition
+    if (recognition) {
+      recognition.stop();
+    }
+    
+    return new Promise((resolve) => {
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+        const transcription = transcriptionDisplay.textContent;
+        
+        // Reset recording state
+        isRecording = false;
+        voiceInteractionBtn.classList.remove('recording');
+        voiceButtonText.textContent = 'Processing...';
+        
+        // Only proceed if we have a transcription
+        if (transcription && transcription !== 'Transcription will appear here...') {
+          await sendVoiceInteraction(audioBlob, transcription);
+        } else {
+          voiceButtonText.textContent = 'Hold to Speak';
+          transcriptionDisplay.textContent = 'No speech detected';
+        }
+        
+        // Stop the tracks to release the microphone
+        mediaRecorder.stream.getTracks().forEach(track => track.stop());
+        resolve();
+      };
+      
+      mediaRecorder.stop();
+    });
+  }
+
+  async function sendVoiceInteraction(audioBlob, transcription) {
+    try {
+      // Get current frame from canvas
+      const imageData = canvas.toDataURL('image/jpeg', 0.7);
+      
+      voiceButtonText.textContent = 'Sending...';
+      
+      // Send to server
+      const response = await fetch('/voice-interaction', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          transcription,
+          imageData
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        // Display the response (remove 'speak:' prefix if present)
+        let displayText = data.response;
+        if (displayText.startsWith('speak:')) {
+          displayText = displayText.substring(6);
+        }
+        
+        responseDisplay.textContent = displayText;
+      } else {
+        responseDisplay.textContent = data.message || 'Error processing request';
+      }
+    } catch (error) {
+      console.error('Voice interaction error:', error);
+      responseDisplay.textContent = `Error: ${error.message}`;
+    } finally {
+      voiceButtonText.textContent = 'Hold to Speak';
+    }
+  }
+
+  function setupVoiceInteraction() {
+    const speechRecognitionAvailable = setupSpeechRecognition();
+    
+    // For desktop: mousedown/mouseup events
+    voiceInteractionBtn.addEventListener('mousedown', startRecording);
+    voiceInteractionBtn.addEventListener('mouseup', stopRecording);
+    voiceInteractionBtn.addEventListener('mouseleave', stopRecording);
+    
+    // For mobile: touchstart/touchend events
+    voiceInteractionBtn.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      startRecording();
+    });
+    
+    voiceInteractionBtn.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      stopRecording();
+    });
+    
+    if (!speechRecognitionAvailable) {
+      voiceButtonText.textContent = 'Speech Recognition Not Available';
+      voiceInteractionBtn.disabled = true;
+    }
+  }
     // Robot bark function
 function makeRobotBark(pattern = null) {
   if (state.barkCooldown) return;
@@ -1049,6 +1298,7 @@ function sleep(ms) {
         setupEventListeners();
         setupCameraControls();
         checkRobotConnection();
+        setupVoiceInteraction();
       } catch (error) {
         console.error('Initialization error:', error);
         alert('Failed to initialize: ' + error.message);
