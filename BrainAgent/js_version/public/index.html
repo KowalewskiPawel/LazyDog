@@ -660,6 +660,36 @@
         <input type="range" id="reactionIntensity" min="1" max="5" step="1" value="3">
         <span id="intensityValue">3</span>
       </div>
+
+      <div class="setting-row">
+        <h3>AI Assistant Integration</h3>
+      </div>
+      
+      <div class="setting-row">
+        <label for="aiIntegrationToggle">Enable AI Responses:</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="aiIntegrationToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      
+      <div class="setting-row">
+        <label for="aiModelSelect">AI Model:</label>
+        <select id="aiModelSelect">
+          <option value="claude">Claude AI</option>
+          <option value="grok">Grok AI</option>
+        </select>
+      </div>
+      
+      <div class="setting-row">
+        <label for="aiPersonalitySelect">AI Personality:</label>
+        <select id="aiPersonalitySelect">
+          <option value="coach">Posture Coach</option>
+          <option value="friendly">Friendly Reminder</option>
+          <option value="strict">Strict Monitor</option>
+          <option value="random">Random / Creative</option>
+        </select>
+      </div>
     </div>
   </div>
 
@@ -675,6 +705,11 @@
       modelType: 'lightning',
       scale: 1.0,
       confidenceThreshold: 0.3,
+
+      aiIntegrationEnabled: true,
+      aiModel: 'claude', 
+      aiPersonality: 'coach',
+      aiResponsePending: false,
 
       robotBarkEnabled: true,
       barkPattern: 'normal',
@@ -777,10 +812,11 @@
     // Reaction intensity slider
     const reactionIntensity = document.getElementById('reactionIntensity');
     const intensityValue = document.getElementById('intensityValue');
-    reactionIntensity.addEventListener('input', () => {
-      state.reactionIntensity = parseInt(reactionIntensity.value);
-      intensityValue.textContent = state.reactionIntensity;
-});
+
+    // AI integration UI elements
+const aiIntegrationToggle = document.getElementById('aiIntegrationToggle');
+const aiModelSelect = document.getElementById('aiModelSelect');
+const aiPersonalitySelect = document.getElementById('aiPersonalitySelect');
 
     // Utility functions
     function calculateAverageShoulderDistance() {
@@ -816,7 +852,6 @@ function makeRobotBark(pattern = null) {
     }, 200);
   }
 }
-
 // Execute bark pattern
 function executeBarkPattern(pattern) {
   const patterns = {
@@ -1055,7 +1090,58 @@ function sleep(ms) {
           });
       }, 5000); // Check every 5 seconds
     }
+    // AI integration state
+state.aiIntegrationEnabled = true;
+state.aiPersonality = 'coach';
+state.aiResponsePending = false;
+
+// Get Claude AI response for posture with image capture
+async function getClaudePostureResponse(postureIssues) {
+  if (!state.aiIntegrationEnabled || state.aiResponsePending) {
+    return null;
+  }
+  
+  state.aiResponsePending = true;
+  
+  try {
+    // Capture the current frame with posture visualization
+    let imageData = null;
     
+    // Only send image data if we have a canvas
+    if (canvas) {
+      // Get base64 image data from canvas (includes skeleton visualization)
+      imageData = canvas.toDataURL('image/jpeg', 0.7); // 70% quality for smaller size
+    }
+    
+    // Call the Claude endpoint
+    const response = await fetch('/claude-posture-response', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        postureIssues,
+        imageData,
+        personality: state.aiPersonality
+      })
+    });
+    
+    const data = await response.json();
+    if (!data.success) {
+      throw new Error(data.message || 'Failed to get Claude response');
+    }
+    
+    return data.response;
+  } catch (error) {
+    console.error('Claude integration error:', error);
+    return null;
+  } finally {
+    // Don't immediately reset - give time between API calls
+    setTimeout(() => {
+      state.aiResponsePending = false;
+    }, 10000); // 10 second cooldown
+  }
+}
     // Setup pose detector
     async function setupPoseDetector() {
       const modelConfig = {
@@ -1375,10 +1461,18 @@ function sleep(ms) {
           const now = Date.now();
           if (now - state.lastNotificationTime > state.notificationFrequency) {
             audioManager.playSound();
-            // Make robot bark if enabled
-            if (state.robotBarkEnabled) {
-              reactToSlouching();
-            }
+                    // Make robot bark if enabled
+                    getClaudePostureResponse(postureIssues).then(response => {
+        if (response) {
+          // The response is already in the format "speak:text"
+          // Send it directly to the robot
+          sendCameraCommand(response);
+        } });
+                    reactToSlouching();
+                  
+                
+            
+            
             updatePostureStatus(postureIssues[0], 'bad');
             state.lastNotificationTime = now;
           }
@@ -1606,6 +1700,19 @@ function sleep(ms) {
         makeRobotBark(state.barkPattern);
         // setTimeout(() => sendCameraCommand('bark'), 200);
       });
+
+      // Set up event listeners
+    aiIntegrationToggle.addEventListener('change', () => {
+      state.aiIntegrationEnabled = aiIntegrationToggle.checked;
+    });
+
+    aiModelSelect.addEventListener('change', () => {
+      state.aiModel = aiModelSelect.value;
+    });
+
+    aiPersonalitySelect.addEventListener('change', () => {
+      state.aiPersonality = aiPersonalitySelect.value;
+    });
     }
     
     // Update FPS counter

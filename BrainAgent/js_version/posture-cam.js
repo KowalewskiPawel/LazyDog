@@ -264,15 +264,15 @@ function makeRobotBark() {
     console.log('Cannot bark: WebSocket not connected or authenticated');
     return false;
   }
-  
+
   console.log('Making robot bark at slouching user');
   robotSocket.send('bark');
-  
+
   // Turn off buzzer after short delay (200ms for a quick bark)
   setTimeout(() => {
     robotSocket.send('bark');
   }, 200);
-  
+
   return true;
 }
 
@@ -291,37 +291,215 @@ function barkSequence(pattern = 'alert') {
     console.log('Cannot bark sequence: WebSocket not connected or authenticated');
     return false;
   }
-  
+
   const patterns = {
     short: [[0.1, 0.1]],
     normal: [[0.2, 0.1], [0.2, 0.1]],
     excited: [[0.1, 0.05], [0.1, 0.05], [0.2, 0.1]],
     alert: [[0.3, 0.1], [0.1, 0.05], [0.1, 0.05]]
   };
-  
+
   const selectedPattern = patterns[pattern] || patterns.normal;
-  
+
   // Execute bark sequence
   let currentIndex = 0;
-  
+
   function executeNextBark() {
     if (currentIndex >= selectedPattern.length) return;
-    
+
     const [duration, pause] = selectedPattern[currentIndex];
     robotSocket.send('bark');
-    
+
     setTimeout(() => {
       robotSocket.send('bark');
       currentIndex++;
-      
+
       if (currentIndex < selectedPattern.length) {
         setTimeout(executeNextBark, pause * 1000);
       }
     }, duration * 1000);
   }
-  
+
   executeNextBark();
   return true;
+}
+
+// AI Integration endpoint
+// Load environment variables
+require('dotenv').config();
+
+// AI Integration endpoint
+app.post('/ai-response', async (req, res) => {
+  const { prompt, model, personality } = req.body;
+  
+  try {
+    let response;
+    
+    // Get API key from environment variables
+    const claudeApiKey = process.env.CLAUDE_API_KEY;
+    const grokApiKey = process.env.GROK_API_KEY;
+    
+    if (model === 'claude') {
+      if (!claudeApiKey) {
+        throw new Error('Claude API key not configured on server');
+      }
+      response = await getClaudeResponse(prompt, claudeApiKey, personality);
+    } else if (model === 'grok') {
+      if (!grokApiKey) {
+        throw new Error('Grok API key not configured on server');
+      }
+      response = await getGrokResponse(prompt, grokApiKey, personality);
+    } else {
+      throw new Error('Unsupported model');
+    }
+    
+    return res.json({
+      success: true,
+      response
+    });
+  } catch (error) {
+    console.error('AI response error:', error);
+    return res.status(500).json({
+      success: false,
+      message: `Error: ${error.message}`
+    });
+  }
+});
+
+// AI Integration endpoint with image support
+app.post('/claude-posture-response', async (req, res) => {
+  const { postureIssues, imageData, personality } = req.body;
+  
+  try {
+    // Get API key from environment variables
+    const claudeApiKey = process.env.CLAUDE_API_KEY;
+    
+    if (!claudeApiKey) {
+      throw new Error('Claude API key not configured on server');
+    }
+    
+    // Get response from Claude with image analysis
+    const response = await getClaudePostureResponse(postureIssues, imageData, claudeApiKey, personality);
+    
+    return res.json({
+      success: true,
+      response
+    });
+  } catch (error) {
+    console.error('Claude posture analysis error:', error);
+    return res.status(500).json({
+      success: false,
+      message: `Error: ${error.message}`
+    });
+  }
+});
+
+// Claude API implementation with image support
+async function getClaudePostureResponse(postureIssues, imageData, apiKey, personality) {
+  const anthropic = require('@anthropic-ai/sdk');
+  const client = new anthropic.Anthropic({
+    apiKey: apiKey
+  });
+  
+  const systemPrompt = getSystemPrompt(personality);
+  
+  try {
+    // Prepare messages with text and image
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `Analyze this posture detection image. The system detected these posture issues: ${postureIssues.join(', ')}. 
+            
+            Please create a response that I can send directly to my robot as a speech command. The command format must be exactly "speak:YOUR MESSAGE HERE" and should be no more than 100 characters long. Do not include any explanation or additional text - only provide the exact command to be sent.`
+          }
+        ]
+      }
+    ];
+    
+    // Add image if provided
+    if (imageData) {
+      // Remove the data:image/jpeg;base64, prefix if present
+      const base64Image = imageData.replace(/^data:image\/\w+;base64,/, '');
+      
+      messages[0].content.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/jpeg',
+          data: base64Image
+        }
+      });
+    }
+    
+    // Use the current most appropriate model
+    const response = await client.messages.create({
+      model: 'claude-3-7-sonnet-20250219', // Or use a different available model
+      max_tokens: 150,
+      system: systemPrompt,
+      messages: messages
+    });
+    
+    let responseText = response.content[0].text.trim();
+    
+    // Ensure response is in the correct format
+    if (!responseText.startsWith('speak:')) {
+      responseText = 'speak:' + responseText;
+    }
+    
+    // Limit response length
+    if (responseText.length > 108) { // "speak:" plus 100 characters
+      responseText = responseText.substring(0, 108);
+    }
+    
+    return responseText;
+  } catch (error) {
+    console.error('Claude API error:', error);
+    // Fallback response if API call fails
+    return 'speak:Please fix your posture.';
+  }
+}
+
+// Grok API implementation
+async function getGrokResponse(prompt, apiKey, personality) {
+  // Implementation would depend on Grok's API structure
+  // This is a placeholder since Grok's API isn't widely available yet
+  const response = await fetch('https://api.grok.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: 'grok-1',
+      messages: [
+        { role: 'system', content: getSystemPrompt(personality) },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 150
+    })
+  });
+
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
+
+// Get system prompt based on personality
+function getSystemPrompt(personality) {
+  switch (personality) {
+    case 'coach':
+      return 'You are a supportive posture coach for a robot that monitors the user\'s posture. Provide short, encouraging reminders about sitting up straight. Keep responses under 100 characters.';
+    case 'friendly':
+      return 'You are a friendly robot companion who gently reminds users about good posture. Be warm and supportive. Keep responses under 100 characters.';
+    case 'strict':
+      return 'You are a strict posture monitor that firmly reminds users to fix their posture immediately. Be direct but not rude. Keep responses under 100 characters.';
+    case 'random':
+      return 'You are a creative robot assistant. Generate unexpected, funny, or surprising ways to remind someone about their posture. Also suggest random robot movements that might help. Be concise and keep responses under 100 characters.';
+    default:
+      return 'You are a posture monitoring robot. Provide short reminders about good posture. Keep responses under 100 characters.';
+  }
 }
 
 // Create a new endpoint for bark sequences
